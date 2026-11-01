@@ -8,7 +8,6 @@ import pg_bitemporal.django.base
 
 
 class Migration(migrations.Migration):
-
     initial = True
 
     dependencies = []

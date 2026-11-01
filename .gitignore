@@ -1,3 +1,6 @@
 *.pyc
+.venv/
+.pytest_cache/
+*.egg-info/
 tmp-pg/
 dist/

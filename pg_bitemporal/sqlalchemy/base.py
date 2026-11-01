@@ -1,6 +1,6 @@
 """Root mixins and base class for bitemporal tables."""
+
 import re
-from typing import List, Tuple
 
 from sqlalchemy import DDL, event, exc, func
 from sqlalchemy.dialects.postgresql import TSTZRANGE, ExcludeConstraint
@@ -8,12 +8,15 @@ from sqlalchemy.orm import declarative_base, declared_attr
 from sqlalchemy.schema import Index, UniqueConstraint
 from sqlalchemy.sql import schema, sqltypes
 
-get_time_period_column = lambda is_pk: schema.Column(
-    TSTZRANGE,
-    nullable=False,
-    primary_key=is_pk,
-    server_default=func.tstzrange(func.now(), None),
-)
+
+def get_time_period_column(is_pk):
+    """Build an application or transaction period column."""
+    return schema.Column(
+        TSTZRANGE,
+        nullable=False,
+        primary_key=is_pk,
+        server_default=func.tstzrange(func.now(), None),
+    )
 
 
 def to_snakecase(name):
@@ -26,7 +29,7 @@ class BaseMixin:
     # The list of fields that make up the "bitemporal key" for the model, which is
     # semantically similar to a "Primary Key". This is the set of values that is unique
     # for a point in app time + txn time.
-    key_fields_and_equality_operators: List[Tuple[str, str]] = []
+    key_fields_and_equality_operators: list[tuple[str, str]] = []
 
     # Primary Key for any bitemporal model; needs to be distinct from the bitemporal
     # key, because the bitemporal key is not unique within the scope of the table.
@@ -43,12 +46,12 @@ class _CurrentBase(BaseMixin):
     # the time dimension relevant to the "transaction" i.e. persistence in `current`
     txn_period = get_time_period_column(is_pk=False)
 
-    @declared_attr
-    def __tablename__(cls) -> str:
+    @declared_attr.directive
+    def __tablename__(cls: type) -> str:
         return to_snakecase(cls.__name__)
 
-    @declared_attr
-    def __table_args__(cls) -> Tuple:
+    @declared_attr.directive
+    def __table_args__(cls) -> tuple:
         return (
             # unique constraint on (*bitmeporal_key, app_period), to allow for FKs
             UniqueConstraint(
@@ -59,8 +62,8 @@ class _CurrentBase(BaseMixin):
             # rows with identical bitemporal-key values can overlap on `app_period`
             ExcludeConstraint(
                 *(
-                    (key_field, equality_operator)
-                    for key_field, equality_operator in cls.key_fields_and_equality_operators
+                    (key_field, op)
+                    for key_field, op in cls.key_fields_and_equality_operators
                 ),
                 ("app_period", "&&"),
                 name=f"{cls.__tablename__}_bitemporal_key_exclusion",
@@ -91,22 +94,24 @@ class _HistoryBase(BaseMixin):
     # keys in the history table; otherwise, it wouldn't be a very useful history table!
     txn_period = get_time_period_column(is_pk=True)
 
-    @declared_attr
-    def __tablename__(cls) -> str:
+    @declared_attr.directive
+    def __tablename__(cls: type) -> str:
         return to_snakecase(cls.__name__)
 
-    @declared_attr
-    def __table_args__(cls) -> Tuple:
+    @declared_attr.directive
+    def __table_args__(cls) -> tuple:
         return (
-            # NOTE: the only difference here is the absence of a `unique_constraint`,
-            # since the history table can include rows with duplicate key/`app_period`.
-            # rows with identical bitemporal-key values can overlap on `app_period`
+            # No unique constraint: a correction retires the previous belief, so
+            # history rows for one key share `app_period` and differ in `txn_period`.
+            # Exclude a row only when both periods overlap. Adjacent transaction
+            # ranges do not overlap, which is what lets the next correction land.
             ExcludeConstraint(
                 *(
-                    (key_field, equality_operator)
-                    for key_field, equality_operator in cls.key_fields_and_equality_operators
+                    (key_field, op)
+                    for key_field, op in cls.key_fields_and_equality_operators
                 ),
                 ("app_period", "&&"),
+                ("txn_period", "&&"),
                 name=f"{cls.__tablename__}_bitemporal_key_exclusion",
             ),
             # indices for bitemporal-key
@@ -128,7 +133,7 @@ CurrentBase = declarative_base(cls=_CurrentBase)
 HistoryBase = declarative_base(cls=_HistoryBase)
 
 
-def to_history_table(current_model_cls, mixin_classes: List):
+def to_history_table(current_model_cls, mixin_classes: list):
     """Generate a history table for a given 'current' table'.
 
     You can do all of this declaratively, but it's not recommended, because it's easy
@@ -168,6 +173,7 @@ def to_history_table(current_model_cls, mixin_classes: List):
     def history_delete_listener(mapper, connection, target):
         raise ValueError("May not delete from {target.__table__.fullname}")
 
+    current_model_cls.history_class = history_model_cls
     history_model_cls.__table__.add_is_dependent_on(current_model_cls.__table__)
     event.listen(
         history_model_cls.__table__,

@@ -1,5 +1,3 @@
-from typing import List, Tuple
-
 from django.contrib.postgres.constraints import ExclusionConstraint
 from django.contrib.postgres.fields.ranges import DateTimeRangeField
 from django.db import connection, models
@@ -15,9 +13,10 @@ def default_range():
 
 
 def generate_bitemporal_tables(
-    mixin_cls: models.Model, key_fields_and_equality_operators: List[Tuple[str, str]]
-) -> Tuple[models.Model, models.Model]:
-    """Generate a current and history table from the given inheriting from `mixin_cls`."""
+    mixin_cls: type[models.Model],
+    key_fields_and_equality_operators: list[tuple[str, str]],
+) -> tuple[type[models.Model], type[models.Model]]:
+    """Generate current and history models inheriting from ``mixin_cls``."""
     class_name: str = mixin_cls.__name__
     if not class_name.endswith("Base"):
         raise ValueError(
@@ -39,11 +38,11 @@ def generate_bitemporal_tables(
     class Current(mixin_cls, metaclass=CurrentMetaClass):
         """Mixin for current table, i.e. values that have not been expired.
 
-        Unfortunately, Django does not allow server-side defaults (i.e. executed by the db).
+        Django cannot set a database-side default for these ranges.
         """
 
         # Primary key, because the bitemporal key is not unique irrespective of time.
-        # UUID is an acceptable choice, but an incrementing integer is a stylistic choice.
+        # UUID is acceptable too. An incrementing integer is a stylistic choice.
         row_id = models.BigAutoField(primary_key=True)
 
         # time dimension relevant to the application
@@ -53,7 +52,7 @@ def generate_bitemporal_tables(
         txn_period = DateTimeRangeField(null=False, default=default_range)
 
         class Meta:
-            app_label = mixin_cls._meta.app_label
+            app_label = getattr(mixin_cls, "_meta").app_label
             db_table = f"{app_label}_{table_name}"
 
             constraints = [
@@ -71,8 +70,8 @@ def generate_bitemporal_tables(
                 ExclusionConstraint(
                     expressions=[
                         *(
-                            (key_field, equality_operator)
-                            for key_field, equality_operator in key_fields_and_equality_operators
+                            (key_field, op)
+                            for key_field, op in key_fields_and_equality_operators
                         ),
                         ("app_period", "&&"),
                     ],
@@ -87,30 +86,29 @@ def generate_bitemporal_tables(
         """Base for 'history' table, i.e. values that have been expired."""
 
         # Primary key, because the bitemporal key is not unique irrespective of time.
-        # UUID is an acceptable choice, but an incrementing integer is a stylistic choice.
+        # UUID is acceptable too. An incrementing integer is a stylistic choice.
         row_id = models.BigAutoField(primary_key=True)
 
         # time dimension relevant to the application
         app_period = DateTimeRangeField(null=False, default=default_range)
 
         # the time dimension relevant to the "transaction" i.e. persistence in `current`
-        # this period joins the PK with `row_id`, because there can be duplicate `row_id`
-        # keys in the history table; otherwise, it wouldn't be a very useful history table!
+        # `txn_period` joins the primary key: history repeats `row_id`
+        # across corrections, or the table would not be a useful history.
         txn_period = DateTimeRangeField(null=False, default=default_range)
 
         class Meta:
-            app_label = mixin_cls._meta.app_label
+            app_label = getattr(mixin_cls, "_meta").app_label
             db_table = f"{app_label}_{table_name}_history"
 
             constraints = [
-                # NOTE: the only difference here is the absence of a `unique_constraint`,
-                # since the history table can include rows with duplicate key/`app_period`.
+                # No unique constraint: history can repeat a key and `app_period`.
                 # rows with identical bitemporal-key values can overlap on `app_period`
                 ExclusionConstraint(
                     expressions=[
                         *(
-                            (key_field, equality_operator)
-                            for key_field, equality_operator in key_fields_and_equality_operators
+                            (key_field, op)
+                            for key_field, op in key_fields_and_equality_operators
                         ),
                         ("app_period", "&&"),
                     ],

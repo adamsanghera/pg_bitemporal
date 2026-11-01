@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Late Letter</title>
+<link rel="stylesheet" href="/style.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js" defer></script>
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header class="bar">
+  <a class="brand" href="#/">The Late Letter</a>
+  <nav class="steps" id="steps" aria-label="Chapters"></nav>
+</header>
+
+<main class="home" id="home" hidden>
+  <p class="kicker">A short game about two kinds of time</p>
+  <h1>The Late Letter</h1>
+  <p class="lede">
+    You've just started as a clerk in a bank's records office. Customers move,
+    letters arrive late, and colleagues make mistakes. Your job is to keep an
+    address book that can always answer two questions:
+    <em class="app-ink">where did they live?</em> and
+    <em class="txn-ink">when did we know?</em>
+  </p>
+  <ol class="cases" id="cases"></ol>
+  <p class="fine">
+    Every answer and every write in this game goes to real
+    <code>pg_bitemporal</code> tables in your local Postgres.
+  </p>
+</main>
+
+<main class="game" id="game" hidden>
+  <aside class="story" aria-live="polite">
+    <p class="kicker" id="ch-kicker"></p>
+    <h2 id="ch-title"></h2>
+    <div class="intro" id="ch-intro"></div>
+    <ol class="goals" id="goals"></ol>
+    <div class="outro" id="ch-outro" hidden></div>
+    <div class="story-foot">
+      <button type="button" class="quiet" id="restart">Start over</button>
+      <button type="button" class="primary" id="next" hidden>Next chapter →</button>
+    </div>
+  </aside>
+
+  <section class="stage">
+    <div class="clock" id="clock">
+      <div class="page" aria-hidden="true"><span class="month" id="clock-month"></span><span class="day" id="clock-day"></span></div>
+      <p><span class="clock-label">Today at the bank is <b id="clock-date"></b>.</span>
+      <span class="clock-note" id="clock-note"></span></p>
+    </div>
+    <div class="chart-wrap" id="chart-wrap">
+      <svg id="chart" class="chart"></svg>
+      <div class="tip" id="tip" hidden></div>
+    </div>
+    <p class="readout" id="readout" aria-live="polite"></p>
+    <p class="nudge" id="nudge"></p>
+
+    <section class="tools" id="tools" hidden>
+      <div class="tool-tabs" id="tool-tabs" role="tablist" hidden>
+        <button type="button" role="tab" data-mode="record" aria-selected="true">Record an address</button>
+        <button type="button" role="tab" data-mode="forget" aria-selected="false">Forget a period</button>
+      </div>
+      <form class="letter" id="write-form" autocomplete="off">
+        <p class="sentence">
+          <span class="who" data-person></span>
+          <span data-for="record">lived at
+            <input name="street" type="text" placeholder="street" aria-label="Street" size="14">
+          </span>
+          <span data-for="forget" hidden>— forget where they lived</span>
+          from <input name="from" type="date" aria-label="True from">
+          <span class="until">
+            until <input name="until" type="date" aria-label="True until" disabled>
+            <label class="still"><input name="still" type="checkbox" checked> still there</label>
+          </span>
+        </p>
+        <p class="sentence">
+          The bank writes this down on
+          <input name="written" type="date" aria-label="Written down on">.
+        </p>
+        <div class="form-foot">
+          <button type="submit" class="primary" id="write-button">Write it in the ledger</button>
+          <p class="form-msg" id="write-msg" role="status"></p>
+        </div>
+      </form>
+    </section>
+
+    <section class="sandbox" id="sandbox" hidden>
+      <form id="person-form" class="person-form">
+        <label for="person-input">Customer</label>
+        <input id="person-input" list="people" type="text" autocomplete="off">
+        <datalist id="people"></datalist>
+        <button type="submit" class="quiet">Open</button>
+      </form>
+      <div class="resets">
+        <button type="button" class="quiet" id="reset-person">Reset this customer</button>
+        <button type="button" class="quiet danger" id="reset-all">Reset every customer</button>
+      </div>
+    </section>
+
+    <section class="hood" id="hood" hidden>
+      <button type="button" class="hood-bar" id="hood-toggle" aria-expanded="false" aria-controls="hood-panel">
+        <span class="hood-icon" aria-hidden="true">⚙</span>
+        <span class="hood-words">
+          <span class="hood-title">Under the hood <span class="hood-new" id="hood-new" hidden>new</span></span>
+          <span class="hood-sub">The real Postgres rows and SQL behind this chart</span>
+        </span>
+        <span class="chev" aria-hidden="true">▾</span>
+      </button>
+      <div class="hood-panel" id="hood-panel" hidden>
+        <div class="hood-tabs" role="tablist">
+          <button type="button" role="tab" data-tab="tables" aria-selected="true">Tables</button>
+          <button type="button" role="tab" data-tab="write" aria-selected="false">Last write</button>
+          <button type="button" role="tab" data-tab="query" aria-selected="false">This question</button>
+        </div>
+        <div class="hood-body" id="hood-body"></div>
+      </div>
+    </section>
+  </section>
+
+</main>
+
+<noscript><p class="wrap">This game needs JavaScript.</p></noscript>
+</body>
+</html>

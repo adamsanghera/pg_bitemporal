@@ -1,5 +1,5 @@
 -- force the transaction time for the sql transaction to be a particular timestamptz
-CREATE OR REPLACE FUNCTION public.set_transaction_time (tmp_fixed_time timestamptz)
+CREATE OR REPLACE FUNCTION public.set_transaction_time (fixed_time timestamptz)
     RETURNS bool
     AS $$
 BEGIN
@@ -11,7 +11,7 @@ BEGIN
     END IF;
 
     -- stop forcing the `fixed_transaction_time`
-    IF (tmp_fixed_time IS NULL) THEN
+    IF (fixed_time IS NULL) THEN
         DROP TABLE IF EXISTS fixed_transaction_time;
         RETURN TRUE;
     END IF;
@@ -20,15 +20,16 @@ BEGIN
     CREATE TEMPORARY TABLE IF NOT EXISTS fixed_transaction_time (
         id int NOT NULL,
         tmp_fixed_time timestamptz NOT NULL,
-        CONSTRAINT transactoin_time_pkey PRIMARY KEY (id )
+        CONSTRAINT transaction_time_pkey PRIMARY KEY (id)
     ) ON COMMIT DROP;
 
-    -- "upsert" the forced time into the temporary table
+    -- EXCLUDED qualifies the new value. An unqualified name is ambiguous
+    -- with the existing row's column.
     INSERT INTO fixed_transaction_time (id, tmp_fixed_time)
-        VALUES (1, tmp_fixed_time)
+        VALUES (1, fixed_time)
     ON CONFLICT (id)
         DO UPDATE SET
-            tmp_fixed_time = tmp_fixed_time;
+            tmp_fixed_time = EXCLUDED.tmp_fixed_time;
 
     RETURN TRUE;
 END;
@@ -88,7 +89,6 @@ CREATE OR REPLACE FUNCTION public.record_txn_history ()
     RETURNS TRIGGER
     AS $$
 DECLARE
-    fixed_transaction_time_table regclass;
     measured_time timestamptz;
 BEGIN
     -- validate the argument (the transaction history table)
@@ -111,14 +111,14 @@ BEGIN
         END IF;
     END IF;
 
-    -- measure time from either fixed value (if set) or current_timestamp
-    SELECT
-        to_regclass ('fixed_transaction_time') INTO fixed_transaction_time_table;
-    IF (fixed_transaction_time_table IS NOT NULL) THEN
+    -- measure time from either fixed value (if set) or current_timestamp.
+    -- to_regclass finds the transaction-local temp table. The SELECT has to
+    -- name that table: a regclass variable is not a FROM item.
+    IF (to_regclass('fixed_transaction_time') IS NOT NULL) THEN
         SELECT
             tmp_fixed_time INTO measured_time
         FROM
-            fixed_transaction_time_table
+            fixed_transaction_time
         WHERE
             id = 1;
     ELSE

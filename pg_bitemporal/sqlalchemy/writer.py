@@ -1,12 +1,13 @@
 """Helpful wrapper of SQLAlchemy.session, for interfacing with bitemporal models."""
+
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Any, Dict
+from datetime import datetime
+from typing import Any
 
-from psycopg2.extras import DateTimeTZRange
+from psycopg.types.range import TimestamptzRange
 from sqlalchemy import orm, sql
-from sqlalchemy.dialects.postgresql import TSTZRANGE
+from sqlalchemy.exc import MultipleResultsFound, NoResultFound
 
 from pg_bitemporal.sqlalchemy.base import CurrentBase
 
@@ -14,53 +15,75 @@ from pg_bitemporal.sqlalchemy.base import CurrentBase
 def _get_split_record_call(schema: str, tablename: str):
     full_name = f'"{schema}"."{tablename}"' if schema is not None else f'"{tablename}"'
 
-    return f"""SELECT split_record(NULL::{full_name}, :row_id, :app_period_1, :app_period_2)"""
+    return (
+        f"SELECT split_record(NULL::{full_name}, :row_id, :app_period_1, :app_period_2)"
+    )
 
 
-class TimeRange(DateTimeTZRange):
+class TimeRange(TimestamptzRange):
+    """Application-time range with containment that knows about open bounds.
+
+    A missing bound is infinity. ``contains(..., non_zero_gaps=True)`` is true
+    only when subtracting the other range leaves a non-empty piece on both sides.
+    """
+
+    __slots__ = ()
+
     def contains(
-        self, other_range: TimeRange | DateTimeTZRange, non_zero_gaps: bool = True
+        self, other_range: TimeRange | TimestamptzRange, non_zero_gaps: bool = True
     ) -> bool:
-        """Return `True` if this range contains the other range.
+        """Return `True` if this range contains ``other_range``.
 
-        This contains `other_range` if this range's boundaries are equal to or outside
-        the boundaries of `other_range`. If `non_zero_gaps` are true, we require there
-        to be a gap (i.e. a subtraction would result in two ranges)
+        With ``non_zero_gaps``, equal open-ended ranges do not count: there is
+        no remainder past the shared infinite bound.
         """
-        if non_zero_gaps:
-            l_method = (
-                "__lte__" if self.lower_inc and not other_range.lower_inc else "__lt__"
-            )
-            u_method = (
-                "__gte__" if self.upper_inc and not other_range.upper_inc else "__gt__"
-            )
-        else:
-            l_method = (
-                "__lt__" if not self.lower_inc and other_range.lower_inc else "__lte__"
-            )
-            u_method = (
-                "__gt__" if not self.upper_inc and other_range.upper_inc else "__gte__"
-            )
+        return self._covers_lower(
+            other_range, strict=non_zero_gaps
+        ) and self._covers_upper(other_range, strict=non_zero_gaps)
 
-        return (
-            (self.lower is None and other_range.lower is not None)
-            or (
-                self.lower is not None
-                and other_range.lower is not None
-                and getattr(self.lower, l_method)(other_range.lower)
-            )
-        ) and (
-            (self.upper is None and other_range.upper is not None)
-            or (
-                self.upper is not None
-                and other_range.upper is not None
-                and getattr(self.upper, u_method)(other_range.upper)
-            )
-        )
+    def starts_before(self, other: TimestamptzRange) -> bool:
+        """Return `True` if this range's lower bound is strictly earlier."""
+        if self.lower is None and other.lower is None:
+            return False
+        if self.lower is None:
+            return True
+        if other.lower is None:
+            return False
+        return self.lower < other.lower
+
+    def _covers_lower(self, other: TimestamptzRange, *, strict: bool) -> bool:
+        if self.lower is None and other.lower is None:
+            return not strict
+        if self.lower is None:
+            return True
+        if other.lower is None:
+            return False
+        if self.lower < other.lower:
+            return True
+        if self.lower > other.lower:
+            return False
+        if strict:
+            return self.lower_inc and not other.lower_inc
+        return not (other.lower_inc and not self.lower_inc)
+
+    def _covers_upper(self, other: TimestamptzRange, *, strict: bool) -> bool:
+        if self.upper is None and other.upper is None:
+            return not strict
+        if self.upper is None:
+            return True
+        if other.upper is None:
+            return False
+        if self.upper > other.upper:
+            return True
+        if self.upper < other.upper:
+            return False
+        if strict:
+            return self.upper_inc and not other.upper_inc
+        return not (other.upper_inc and not self.upper_inc)
 
 
 class Writer:
-    """Helper class for making common queries and mutations to 'Current' tables."""
+    """Queries and mutations for a current table and its history table."""
 
     def __init__(self, model_cls, session):
         if not issubclass(model_cls, CurrentBase):
@@ -69,22 +92,57 @@ class Writer:
         self.model_cls = model_cls
         self.session = session
 
-    def query_key(self, key: Dict[str, Any]) -> orm.query.Query:
+    def query_key(self, key: dict[str, Any]) -> orm.query.Query:
         """Build a query into the current table of a model, given a bitemporal key."""
-        query = self.session.query(self.model_cls)
+        return self._query_key(self.model_cls, key)
+
+    def as_of(self, key: dict[str, Any], *, app_time: datetime, txn_time: datetime):
+        """Return the belief for ``key`` that contains both instants.
+
+        ``app_time`` is when the fact was true. ``txn_time`` is when the
+        database believed it. Periods are half-open: the lower bound is
+        included and the upper bound is not. Exactly one current or history
+        row must match.
+        """
+        history_cls = getattr(self.model_cls, "history_class", None)
+        if history_cls is None:
+            raise ValueError(
+                f"{self.model_cls.__name__} has no history table. "
+                "Call to_history_table first."
+            )
+
+        found = []
+        for model_cls in (self.model_cls, history_cls):
+            found.extend(
+                self._query_key(model_cls, key)
+                .filter(model_cls.app_period.contains(app_time))
+                .filter(model_cls.txn_period.contains(txn_time))
+                .all()
+            )
+        if not found:
+            raise NoResultFound(
+                f"no belief for {key} at app {app_time} as of txn {txn_time}"
+            )
+        if len(found) > 1:
+            raise MultipleResultsFound(
+                f"{len(found)} beliefs for {key} at app {app_time} as of txn {txn_time}"
+            )
+        return found[0]
+
+    def _query_key(self, model_cls, key: dict[str, Any]) -> orm.query.Query:
+        query = self.session.query(model_cls)
 
         # validate bitemporal key is a complete key
         key_fields = set(
-            key_field
-            for key_field, _ in self.model_cls.key_fields_and_equality_operators
+            key_field for key_field, _ in model_cls.key_fields_and_equality_operators
         )
         missing_fields = key_fields - key.keys()
         if missing_fields:
             raise ValueError(f"Missing values for bitemporal key: {missing_fields}")
 
         # iterate through fields, applying filters. raise on inappropriate nulls
-        for key_field, _ in self.model_cls.key_fields_and_equality_operators:
-            key_col = getattr(self.model_cls, key_field)
+        for key_field, _ in model_cls.key_fields_and_equality_operators:
+            key_col = getattr(model_cls, key_field)
 
             # build the query line, and prevent unintuitive null-y problems
             if key[key_field] is None:
@@ -98,7 +156,7 @@ class Writer:
 
         return query
 
-    def clear_key_period(self, key: Dict[str, Any], free_period: TimeRange) -> None:
+    def clear_key_period(self, key: dict[str, Any], free_period: TimeRange) -> None:
         """Free up values for the given key in application-time.
 
         For each record that overlaps with the given bitemporal key-space, we either:
@@ -106,89 +164,79 @@ class Writer:
             2. Partition the record into two distinct application periods.
             3. Trim the application period's prefix or suffix.
         """
-        # iterate through instances of the primary key that overlap with the free period
-        for record in self.query_key(key=key).filter(
-            self.model_cls.app_period.overlaps(free_period)
-        ):
-            original_period: DateTimeTZRange = record.app_period
-            original_period.__class__ = TimeRange
+        # Load first. Deleting or updating while the query streams skips rows.
+        overlaps = (
+            self.query_key(key=key)
+            .filter(self.model_cls.app_period.overlaps(free_period))
+            .all()
+        )
+        for record in overlaps:
+            stored_period: TimestamptzRange = record.app_period
+            original_period = TimeRange(
+                stored_period.lower,
+                stored_period.upper,
+                bounds=stored_period.bounds,
+            )
 
-            # record *is contained by* `free_period`: it should be deleted
-            if free_period.contains(original_period):
+            # The free span covers this row, including an identical open end.
+            if free_period.contains(original_period, non_zero_gaps=False):
                 self.session.delete(record)
-                print(f"free {free_period} contains original {original_period}")
                 continue
 
-            # record *contains* `free_period`: it should be partitioned
+            # Strictly inside: a non-empty prefix and suffix both remain.
             # app_p : [-----)
             # free_p:   [-)
             # result: [-) [-)
             if original_period.contains(free_period):
-                print(f"original {original_period} contains free {free_period}")
-                self.session.execute(
+                # split_record deletes the wide row and inserts the two remnants.
+                # The session still holds the deleted instance, so drop it.
+                split = self.session.execute(
                     sql.text(
                         _get_split_record_call(
                             schema=self.model_cls.__table__.schema,
                             tablename=self.model_cls.__tablename__,
                         )
                     ).bindparams(
-                        app_period_1=DateTimeTZRange(
+                        app_period_1=TimestamptzRange(
                             lower=original_period.lower,
                             upper=free_period.lower,
                             bounds=("[" if original_period.lower_inc else "(")
-                            + ("]" if not free_period.lower_inc else ")"),
+                            + (")" if free_period.lower_inc else "]"),
                         ),
-                        app_period_2=DateTimeTZRange(
+                        app_period_2=TimestamptzRange(
                             lower=free_period.upper,
                             upper=original_period.upper,
-                            bounds=("[" if not free_period.upper_inc else "(")
+                            bounds=("(" if free_period.upper_inc else "[")
                             + ("]" if original_period.upper_inc else ")"),
                         ),
                         row_id=record.row_id,
                     )
-                )
+                ).scalar()
+                if not split:
+                    raise ValueError(f"row_id {record.row_id} was not split")
+                self.session.expunge(record)
                 continue
 
-            print(
-                f"free {free_period} and original {original_period} partially overlap"
-            )
-
-            # what's left? the record must partially-overlap on the left or right.
-            # app_period :   [---)
-            # free_period: ----)
-            # new_period :     [-)
-            #
-            #         ...or...
-            #
-            # app_period :   [---)
-            # free_period:     [----
-            # new_period     [-)
-            record.app_period = (
-                # trim prefix
-                DateTimeTZRange(
-                    lower=free_period.upper,
-                    upper=original_period.upper,
-                    bounds=(
-                        ("[" if not free_period.upper_inc else "(")
-                        + ("]" if original_period.upper_inc else ")")
-                    ),
-                )
-                if (
-                    free_period.lower is None
-                    or (
-                        original_period.lower is not None
-                        and free_period.lower < original_period.lower
-                    )
-                )
-                # trim suffix
-                else DateTimeTZRange(
+            # Partial overlap. Keep the side that starts earlier.
+            # app_period : [---)
+            # free_period:   [----
+            # kept       : [-)
+            if original_period.starts_before(free_period):
+                record.app_period = TimestamptzRange(
                     lower=original_period.lower,
                     upper=free_period.lower,
-                    bounds=(
-                        ("[" if original_period.lower_inc else "(")
-                        + ("]" if not free_period.lower_inc else ")")
-                    ),
+                    bounds=("[" if original_period.lower_inc else "(")
+                    + (")" if free_period.lower_inc else "]"),
                 )
-            )
+            else:
+                # app_period :   [---)
+                # free_period: [--)
+                # kept       :     [-)
+                record.app_period = TimestamptzRange(
+                    lower=free_period.upper,
+                    upper=original_period.upper,
+                    bounds=("(" if free_period.upper_inc else "[")
+                    + ("]" if original_period.upper_inc else ")"),
+                )
 
         self.session.flush()
