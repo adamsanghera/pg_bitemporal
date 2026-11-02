@@ -1,3 +1,8 @@
+-- Exclusion constraints on the key need btree_gist, and record_txn_history and
+-- split_record use hstore. Creating an extension needs CREATE on the database.
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+CREATE EXTENSION IF NOT EXISTS hstore;
+
 -- Both helpers below keep their state in custom settings set with
 -- `set_config(..., is_local => true)`. Postgres resets a local setting when the
 -- transaction ends, commit or rollback, so nothing outlives the transaction. An empty
@@ -81,6 +86,9 @@ CREATE OR REPLACE FUNCTION public.record_txn_history ()
 DECLARE
     measured_time timestamptz;
     fixed_time text;
+    old_values hstore;
+    history_columns text[];
+    unmatched text[];
 BEGIN
     -- validate the argument (the transaction history table)
     -- TODO: validate table exists; although we'll raise further down if it doesn't.
@@ -125,8 +133,29 @@ BEGIN
         ELSE
             -- most commoon scenario: clear space for new value's transaction period
             OLD.txn_period := tstzrange(lower(OLD.txn_period), measured_time);
-            EXECUTE format('insert into %s select $1.*', TG_ARGV[0])
-            USING old;
+            -- Copy by column name, not position: the history table's columns may be
+            -- in another order. hstore round-trips each value through its type's
+            -- text form. A current column with no history column would be dropped,
+            -- so refuse it; a missing NOT NULL value fails on insert by itself.
+            old_values := hstore(OLD);
+            SELECT
+                array_agg(attname::text) INTO history_columns
+            FROM
+                pg_attribute
+            WHERE
+                attrelid = TG_ARGV[0]::regclass
+                AND attnum > 0
+                AND NOT attisdropped;
+            unmatched := akeys(old_values - history_columns);
+            IF (cardinality(unmatched) > 0) THEN
+                RAISE EXCEPTION '% has no column for %', TG_ARGV[0], unmatched
+                    USING hint = 'Add the columns to the history table, or drop '
+                        'them from the current table.';
+            END IF;
+            EXECUTE format(
+                'INSERT INTO %1$s SELECT (populate_record(NULL::%1$s, $1)).*',
+                TG_ARGV[0])
+            USING old_values;
     END IF;
 
     -- update: basically an insert, since we've cleared `old.txn_period`
