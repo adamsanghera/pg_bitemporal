@@ -22,7 +22,9 @@ def _book_url() -> str:
         "PG_BITEMPORAL_TEST_URL",
         "postgresql+psycopg://127.0.0.1:5432/pg_bitemporal_test",
     )
-    return str(make_url(raw).set(database="pg_bitemporal_example_test"))
+    url = make_url(raw).set(database="pg_bitemporal_example_test")
+    # str(url) masks the password as ***, which then fails to authenticate.
+    return url.render_as_string(hide_password=False)
 
 
 def _open(url: str, body: dict | None = None):
