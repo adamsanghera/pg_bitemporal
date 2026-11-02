@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from psycopg.types.range import TimestamptzRange
 from sqlalchemy import orm, sql
+from sqlalchemy.dialects.postgresql import Range
 from sqlalchemy.exc import MultipleResultsFound, NoResultFound
 
 from pg_bitemporal.sqlalchemy.base import Bitemporal, bitemporal_key
@@ -82,6 +83,24 @@ class TimeRange(TimestamptzRange):
         return not (other.upper_inc and not self.upper_inc)
 
 
+_BOUNDS: dict[tuple[bool, bool], Literal["()", "[)", "(]", "[]"]] = {
+    (False, False): "()",
+    (True, False): "[)",
+    (False, True): "(]",
+    (True, True): "[]",
+}
+
+
+def _range(
+    lower: datetime | None,
+    upper: datetime | None,
+    *,
+    lower_inc: bool,
+    upper_inc: bool,
+) -> Range[datetime]:
+    return Range(lower, upper, bounds=_BOUNDS[lower_inc, upper_inc])
+
+
 class Writer:
     """Queries and mutations for a current table and its history table."""
 
@@ -107,7 +126,7 @@ class Writer:
         row must match.
         """
         found = []
-        for model_cls in (self.model_cls, self.model_cls.__history__):
+        for model_cls in (self.model_cls, self.model_cls.__history_model__):
             found.extend(
                 self._query_key(model_cls, key)
                 .filter(model_cls.app_period.contains(app_time))
@@ -166,7 +185,7 @@ class Writer:
             .all()
         )
         for record in overlaps:
-            stored_period: TimestamptzRange = record.app_period
+            stored_period = record.app_period
             original_period = TimeRange(
                 stored_period.lower,
                 stored_period.upper,
@@ -204,7 +223,8 @@ class Writer:
                             bounds=("(" if free_period.upper_inc else "[")
                             + ("]" if original_period.upper_inc else ")"),
                         ),
-                        row_id=record.row_id,
+                        # text: split_record casts it to the row_id column's type
+                        row_id=str(record.row_id),
                     )
                 ).scalar()
                 if not split:
@@ -217,21 +237,21 @@ class Writer:
             # free_period:   [----
             # kept       : [-)
             if original_period.starts_before(free_period):
-                record.app_period = TimestamptzRange(
-                    lower=original_period.lower,
-                    upper=free_period.lower,
-                    bounds=("[" if original_period.lower_inc else "(")
-                    + (")" if free_period.lower_inc else "]"),
+                record.app_period = _range(
+                    original_period.lower,
+                    free_period.lower,
+                    lower_inc=original_period.lower_inc,
+                    upper_inc=not free_period.lower_inc,
                 )
             else:
                 # app_period :   [---)
                 # free_period: [--)
                 # kept       :     [-)
-                record.app_period = TimestamptzRange(
-                    lower=free_period.upper,
-                    upper=original_period.upper,
-                    bounds=("(" if free_period.upper_inc else "[")
-                    + ("]" if original_period.upper_inc else ")"),
+                record.app_period = _range(
+                    free_period.upper,
+                    original_period.upper,
+                    lower_inc=not free_period.upper_inc,
+                    upper_inc=original_period.upper_inc,
                 )
 
         self.session.flush()

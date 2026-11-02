@@ -26,7 +26,7 @@ class Order(Bitemporal, Base):
         )
 
 
-OrderHistory = Order.__history__
+OrderHistory = Order.__history_model__
 
 install_functions(engine)
 Base.metadata.create_all(engine)

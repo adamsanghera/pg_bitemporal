@@ -47,7 +47,7 @@ from sqlalchemy.exc import MultipleResultsFound, NoResultFound, OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from pg_bitemporal.sqlalchemy import install_functions
-from pg_bitemporal.sqlalchemy.base import Bitemporal
+from pg_bitemporal.sqlalchemy.base import Bitemporal, BitemporalHistory
 from pg_bitemporal.sqlalchemy.writer import TimeRange, Writer
 
 DEFAULT_URL = "postgresql+psycopg://127.0.0.1:5432/pg_bitemporal_example"
@@ -99,14 +99,17 @@ class Base(DeclarativeBase):
     pass
 
 
+class ResidenceHistory(BitemporalHistory):
+    person: Mapped[str]
+    street: Mapped[str]
+
+
 class Residence(Bitemporal, Base):
     __tablename__ = "residence"
     __bitemporal_key__ = ("person",)
+    __history_model__ = ResidenceHistory
     person: Mapped[str] = mapped_column(String)
     street: Mapped[str] = mapped_column(String)
-
-
-ResidenceHistory = Residence.__history__
 
 
 class Invalid(ValueError):
