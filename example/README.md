@@ -1,8 +1,7 @@
 prereqs:
 
-1. create database `example` with username/password `example`
-1. create extension 'btree_gist'
-1. run `pg_bitemporal/functions.sql` against the database
+1. create database `example` with username/password `example`, allowed to create
+   extensions (the app installs `btree_gist`, `hstore`, and the functions itself)
 1. run `uv run python example/sqlalchemy/app.py` from the repository root
 
 ## The Late Letter
@@ -20,7 +19,7 @@ time, at http://127.0.0.1:8080:
 6. Free play with every tool.
 
 It needs a local Postgres. It creates `pg_bitemporal_example` on port 5432 and
-loads `btree_gist`, `hstore`, and `pg_bitemporal/functions.sql`. The chart uses
+installs the functions with `install_functions`. The chart uses
 d3 from cdnjs.
 
     uv run python example/web/app.py

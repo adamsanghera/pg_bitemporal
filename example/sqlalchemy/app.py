@@ -2,6 +2,7 @@ from sqlalchemy import Column, create_engine
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import scoped_session, sessionmaker
 
+from pg_bitemporal.sqlalchemy import install_functions
 from pg_bitemporal.sqlalchemy.base import CurrentBase, HistoryBase, to_history_table
 
 engine = create_engine("postgresql+psycopg://example:example@localhost:5432/example")
@@ -25,5 +26,6 @@ class Order(OrderMixin, CurrentBase):
 
 OrderHistory = to_history_table(current_model_cls=Order, mixin_classes=[OrderMixin])
 
+install_functions(engine)
 CurrentBase.metadata.create_all(engine)
 HistoryBase.metadata.create_all(engine)

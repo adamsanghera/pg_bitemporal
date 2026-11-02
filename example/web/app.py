@@ -47,6 +47,7 @@ from sqlalchemy.engine.url import make_url
 from sqlalchemy.exc import MultipleResultsFound, NoResultFound, OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
+from pg_bitemporal.sqlalchemy import install_functions
 from pg_bitemporal.sqlalchemy.base import CurrentBase, HistoryBase, to_history_table
 from pg_bitemporal.sqlalchemy.writer import TimeRange, Writer
 
@@ -63,7 +64,6 @@ _CASTS = (
 )
 _TIMESTAMPTZ = DateTime(timezone=True)
 _HERE = Path(__file__).resolve().parent
-_FUNCTIONS = _HERE.parents[1] / "pg_bitemporal" / "functions.sql"
 _STATIC = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/index.html": ("index.html", "text/html; charset=utf-8"),
@@ -279,19 +279,6 @@ def _ensure_database(url: str) -> None:
         admin.dispose()
 
 
-def _load_functions(engine: Engine) -> None:
-    sql = _FUNCTIONS.read_text(encoding="utf-8")
-    raw = engine.raw_connection()
-    try:
-        cursor = raw.cursor()
-        cursor.execute("CREATE EXTENSION IF NOT EXISTS btree_gist")
-        cursor.execute("CREATE EXTENSION IF NOT EXISTS hstore")
-        cursor.execute(sql)
-        raw.commit()
-    finally:
-        raw.close()
-
-
 def boot(url: str) -> None:
     """Create the database and tables, and seed every story the book lacks."""
     global ENGINE, SessionFactory
@@ -310,7 +297,7 @@ def boot(url: str) -> None:
         if log is not None and statement.strip().upper() != "SELECT 1":
             log.append(show_sql(statement, parameters))
 
-    _load_functions(engine)
+    install_functions(engine)
     CurrentBase.metadata.create_all(engine)
     HistoryBase.metadata.create_all(engine)
     ENGINE = engine

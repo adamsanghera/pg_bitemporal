@@ -8,7 +8,6 @@ creates that database if the server is up.
 import os
 import re
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 
 import psycopg
 import pytest
@@ -28,6 +27,7 @@ from sqlalchemy.engine.url import make_url
 from sqlalchemy.exc import DBAPIError, NoResultFound, OperationalError
 from sqlalchemy.orm import sessionmaker
 
+from pg_bitemporal.sqlalchemy import install_functions
 from pg_bitemporal.sqlalchemy.base import (
     CurrentBase,
     HistoryBase,
@@ -109,20 +109,10 @@ def _ensure_database(url: str) -> None:
 
 
 def _rebuild(engine) -> None:
-    functions = Path(__file__).resolve().parents[1] / "pg_bitemporal" / "functions.sql"
-    sql = functions.read_text(encoding="utf-8")
-    raw = engine.raw_connection()
-    try:
-        cursor = raw.cursor()
-        cursor.execute("DROP SCHEMA IF EXISTS public CASCADE")
-        cursor.execute("CREATE SCHEMA public")
-        cursor.execute("CREATE EXTENSION IF NOT EXISTS btree_gist")
-        cursor.execute("CREATE EXTENSION IF NOT EXISTS hstore")
-        cursor.execute(sql)
-        raw.commit()
-    finally:
-        raw.close()
-
+    with engine.begin() as conn:
+        conn.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
+        conn.execute(text("CREATE SCHEMA public"))
+    install_functions(engine)
     CurrentBase.metadata.create_all(engine)
     HistoryBase.metadata.create_all(engine)
 
@@ -569,3 +559,12 @@ def test_history_copy_refuses_to_drop_a_column(raw_tables):
     )
     with pytest.raises(DBAPIError, match=r"swap_history has no column for \{note\}"):
         _insert_and_update_swap(session)
+
+
+def test_install_functions_can_run_again(engine):
+    """Installing over an existing install changes nothing and does not fail."""
+    install_functions(engine)
+    with engine.connect() as conn:
+        install_functions(conn)
+        conn.rollback()
+        assert conn.execute(text("SELECT public.toggle_record_history(true)")).scalar()
