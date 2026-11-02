@@ -1,8 +1,9 @@
 # Overview
 
 pg_bitemporal keeps a bitemporal history of a Postgres table: what was true when
-(application time), and what the database believed when (transaction time). The
-heavy lifting is a trigger in Postgres, with bindings for SQLAlchemy and Django.
+(application time), and what the database believed when (transaction time). A
+Postgres trigger records the history. SQLAlchemy and Django bindings define the
+tables and query them.
 
 SQLAlchemy support:
 
