@@ -7,6 +7,7 @@ creates that database if the server is up.
 
 import os
 import re
+import uuid
 from datetime import UTC, datetime, timedelta
 
 import psycopg
@@ -14,26 +15,23 @@ import pytest
 from psycopg import OperationalError as PsycopgOperationalError
 from psycopg.types.range import TimestamptzRange
 from sqlalchemy import (
-    Column,
     DateTime,
     Integer,
     String,
+    Table,
     bindparam,
     create_engine,
     event,
+    func,
+    inspect,
     text,
 )
 from sqlalchemy.engine.url import make_url
 from sqlalchemy.exc import DBAPIError, NoResultFound, OperationalError
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from pg_bitemporal.sqlalchemy import install_functions
-from pg_bitemporal.sqlalchemy.base import (
-    CurrentBase,
-    HistoryBase,
-    history_class_of,
-    to_history_table,
-)
+from pg_bitemporal.sqlalchemy.base import Bitemporal, BitemporalHistory
 from pg_bitemporal.sqlalchemy.writer import TimeRange, Writer
 
 JAN_1 = datetime(2022, 1, 1, tzinfo=UTC)
@@ -57,17 +55,32 @@ APP_PERIOD = TimestamptzRange(JAN_1, None)
 _TIMESTAMPTZ = DateTime(timezone=True)
 
 
-class _AddressMixin:
-    key_fields_and_equality_operators = [("user_id", "=")]
-    user_id = Column(Integer, nullable=False)
-    street = Column(String, nullable=False)
-
-
-class Address(_AddressMixin, CurrentBase):
+class _Base(DeclarativeBase):
     pass
 
 
-AddressHistory = to_history_table(Address, [_AddressMixin])
+class AddressHistory(BitemporalHistory):
+    user_id: Mapped[int]
+    street: Mapped[str]
+
+
+class Address(Bitemporal, _Base):
+    __tablename__ = "address"
+    __bitemporal_key__ = ("user_id",)
+    __history_model__ = AddressHistory
+    user_id: Mapped[int] = mapped_column(Integer)
+    street: Mapped[str] = mapped_column(String)
+
+
+class Ticket(Bitemporal[uuid.UUID], _Base):
+    """A uuid primary key, filled in by the database."""
+
+    __tablename__ = "ticket"
+    __bitemporal_key__ = ("code",)
+    row_id: Mapped[uuid.UUID] = mapped_column(
+        primary_key=True, server_default=func.gen_random_uuid()
+    )
+    code: Mapped[str]
 
 
 def _ident(name: str) -> str:
@@ -113,8 +126,7 @@ def _rebuild(engine) -> None:
         conn.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
         conn.execute(text("CREATE SCHEMA public"))
     install_functions(engine)
-    CurrentBase.metadata.create_all(engine)
-    HistoryBase.metadata.create_all(engine)
+    _Base.metadata.create_all(engine)
 
 
 @pytest.fixture(scope="module")
@@ -195,6 +207,7 @@ def _street(session, user_id: int, *, txn_time, app_time) -> str:
     belief = Writer(Address, session).as_of(
         {"user_id": user_id}, app_time=app_time, txn_time=txn_time
     )
+    assert isinstance(belief, (Address, AddressHistory))
     return belief.street
 
 
@@ -370,11 +383,46 @@ def test_as_of_raises_when_no_row_contains_both_times(session, user_id):
         writer.as_of({"user_id": user_id + 1}, app_time=JUN_1, txn_time=JAN_15)
 
 
-def test_to_history_table_returns_the_same_class_when_called_again():
-    """A second call hands back the mapped class, never a bare Table."""
-    assert to_history_table(Address, [_AddressMixin]) is AddressHistory
-    assert history_class_of(Address) is AddressHistory
-    assert not hasattr(Address, "history_class")
+def test_the_mixin_builds_a_history_model_on_the_same_metadata():
+    """Declaring the model is enough: its history is mapped beside it."""
+    history = AddressHistory.__table__
+    assert Address.__history_model__ is AddressHistory
+    assert history.name == "address_history"
+    assert history.metadata is _Base.metadata
+    assert [c.name for c in history.primary_key] == ["row_id", "txn_period"]
+    assert [c.name for c in history.columns] == [
+        c.name for c in inspect(Address).local_table.columns
+    ]
+
+
+def test_table_args_do_not_drop_the_bitemporal_constraints():
+    """The mixin adds its constraints to the table, so __table_args__ is free."""
+
+    class Base(DeclarativeBase):
+        pass
+
+    class Tagged(Bitemporal, Base):
+        __tablename__ = "tagged"
+        __table_args__ = {"comment": "mine"}
+        __bitemporal_key__ = {"label": "="}
+        label: Mapped[str]
+
+    table = inspect(Tagged).local_table
+    assert isinstance(table, Table)
+    names = {c.name for c in table.constraints}
+    assert {"tagged_bitemporal_unique_key", "tagged_bitemporal_key_exclusion"} <= names
+    assert table.comment == "mine"
+
+
+def test_a_model_without_a_key_is_refused():
+    class Base(DeclarativeBase):
+        pass
+
+    with pytest.raises(TypeError, match="must set __bitemporal_key__"):
+
+        class Keyless(Bitemporal, Base):
+            __tablename__ = "keyless"
+            name: Mapped[str]
 
 
 @pytest.mark.parametrize(
@@ -568,3 +616,69 @@ def test_install_functions_can_run_again(engine):
         install_functions(conn)
         conn.rollback()
         assert conn.execute(text("SELECT public.toggle_record_history(true)")).scalar()
+
+
+def test_a_generated_history_model_is_named_after_the_model():
+    history = Ticket.__history_model__
+    assert history.__name__ == "TicketHistory"
+    assert history.__tablename__ == "ticket_history"
+    assert issubclass(history, BitemporalHistory)
+
+
+def test_a_uuid_row_id_survives_a_split(session):
+    """split_record casts the text id to uuid, and new rows take the default."""
+    _write_at(
+        session,
+        JAN_1,
+        lambda: session.add(Ticket(code="T-1", app_period=APP_PERIOD)),
+    )
+    original = session.query(Ticket).one()
+    original_id = original.row_id
+
+    _write_at(
+        session,
+        JUN_20,
+        lambda: Writer(Ticket, session).clear_key_period(
+            {"code": "T-1"}, TimeRange(JUN_1, JUN_13)
+        ),
+    )
+
+    pieces = session.query(Ticket).order_by(Ticket.app_period).all()
+    assert [(p.app_period.lower, p.app_period.upper) for p in pieces] == [
+        (JAN_1, JUN_1),
+        (JUN_13, None),
+    ]
+    ids = {p.row_id for p in pieces}
+    assert len(ids) == 2 and original_id not in ids
+    assert all(isinstance(i, uuid.UUID) for i in ids)
+    retired = session.query(Ticket.__history_model__).one()
+    assert retired.row_id == original_id
+
+
+def test_a_row_id_the_database_cannot_fill_is_refused():
+    class Base(DeclarativeBase):
+        pass
+
+    with pytest.raises(TypeError, match="row_id needs a database default"):
+
+        class Handmade(Bitemporal[uuid.UUID], Base):
+            __tablename__ = "handmade"
+            __bitemporal_key__ = ("name",)
+            row_id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+            name: Mapped[str]
+
+
+def test_a_declared_history_model_must_match_the_columns():
+    class Base(DeclarativeBase):
+        pass
+
+    class WrongHistory(BitemporalHistory):
+        nmae: Mapped[str]
+
+    with pytest.raises(TypeError, match=r"annotates \['nmae'\]"):
+
+        class Right(Bitemporal, Base):
+            __tablename__ = "right"
+            __bitemporal_key__ = ("name",)
+            __history_model__ = WrongHistory
+            name: Mapped[str]

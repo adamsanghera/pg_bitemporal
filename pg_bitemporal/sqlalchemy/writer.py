@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
-from typing import Any
+from typing import Literal
 
 from psycopg.types.range import TimestamptzRange
-from sqlalchemy import orm, sql
+from sqlalchemy import Table, sql
+from sqlalchemy.dialects.postgresql import Range
 from sqlalchemy.exc import MultipleResultsFound, NoResultFound
+from sqlalchemy.orm import Query, Session, class_mapper
 
-from pg_bitemporal.sqlalchemy.base import CurrentBase, history_class_of
+from pg_bitemporal.sqlalchemy.base import Bitemporal, BitemporalHistory, bitemporal_key
 
 
-def _get_split_record_call(schema: str, tablename: str):
+def _get_split_record_call(schema: str | None, tablename: str) -> str:
     full_name = f'"{schema}"."{tablename}"' if schema is not None else f'"{tablename}"'
 
     return (
@@ -82,43 +85,63 @@ class TimeRange(TimestamptzRange):
         return not (other.upper_inc and not self.upper_inc)
 
 
-class Writer:
+_BOUNDS: dict[tuple[bool, bool], Literal["()", "[)", "(]", "[]"]] = {
+    (False, False): "()",
+    (True, False): "[)",
+    (False, True): "(]",
+    (True, True): "[]",
+}
+
+
+def _range(
+    lower: datetime | None,
+    upper: datetime | None,
+    *,
+    lower_inc: bool,
+    upper_inc: bool,
+) -> Range[datetime]:
+    return Range(lower, upper, bounds=_BOUNDS[lower_inc, upper_inc])
+
+
+# A key maps each key column to its value, whatever the column's type.
+Key = Mapping[str, object]
+
+
+class Writer[ModelT: Bitemporal[object]]:
     """Queries and mutations for a current table and its history table."""
 
-    def __init__(self, model_cls, session):
-        if not issubclass(model_cls, CurrentBase):
-            raise ValueError(f"`model_cls` must be a child of {str(CurrentBase)}")
-
-        self.model_cls = model_cls
+    def __init__(self, model_cls: type[ModelT], session: Session) -> None:
+        self.model_cls: type[ModelT] = model_cls
         self.session = session
+        # Checked at runtime too, for callers without a type checker.
+        table = class_mapper(model_cls).local_table
+        if not (issubclass(model_cls, Bitemporal) and isinstance(table, Table)):
+            raise ValueError("`model_cls` must be a mapped Bitemporal model")
+        self._table = table
 
-    def query_key(self, key: dict[str, Any]) -> orm.query.Query:
+    def query_key(self, key: Key) -> Query[ModelT]:
         """Build a query into the current table of a model, given a bitemporal key."""
         return self._query_key(self.model_cls, key)
 
-    def as_of(self, key: dict[str, Any], *, app_time: datetime, txn_time: datetime):
+    def as_of(
+        self, key: Key, *, app_time: datetime, txn_time: datetime
+    ) -> ModelT | BitemporalHistory:
         """Return the belief for ``key`` that contains both instants.
 
         ``app_time`` is when the fact was true. ``txn_time`` is when the
         database believed it. Periods are half-open: the lower bound is
         included and the upper bound is not. Exactly one current or history
-        row must match.
+        row must match. It is a current-model or a history-model instance.
         """
-        history_cls = history_class_of(self.model_cls)
-        if history_cls is None:
-            raise ValueError(
-                f"{self.model_cls.__name__} has no history table. "
-                "Call to_history_table first."
-            )
-
-        found = []
-        for model_cls in (self.model_cls, history_cls):
-            found.extend(
-                self._query_key(model_cls, key)
-                .filter(model_cls.app_period.contains(app_time))
-                .filter(model_cls.txn_period.contains(txn_time))
-                .all()
-            )
+        current, history = self.model_cls, self.model_cls.__history_model__
+        found: list[ModelT | BitemporalHistory] = [
+            *self._query_key(current, key)
+            .filter(current.app_period.contains(app_time))
+            .filter(current.txn_period.contains(txn_time)),
+            *self._query_key(history, key)
+            .filter(history.app_period.contains(app_time))
+            .filter(history.txn_period.contains(txn_time)),
+        ]
         if not found:
             raise NoResultFound(
                 f"no belief for {key} at app {app_time} as of txn {txn_time}"
@@ -129,19 +152,19 @@ class Writer:
             )
         return found[0]
 
-    def _query_key(self, model_cls, key: dict[str, Any]) -> orm.query.Query:
+    def _query_key[R](self, model_cls: type[R], key: Key) -> Query[R]:
         query = self.session.query(model_cls)
 
-        # validate bitemporal key is a complete key
-        key_fields = set(
-            key_field for key_field, _ in model_cls.key_fields_and_equality_operators
-        )
+        # validate bitemporal key is a complete key. The history model shares the
+        # current model's key.
+        key_pairs = bitemporal_key(self.model_cls)
+        key_fields = {key_field for key_field, _ in key_pairs}
         missing_fields = key_fields - key.keys()
         if missing_fields:
             raise ValueError(f"Missing values for bitemporal key: {missing_fields}")
 
         # iterate through fields, applying filters. raise on inappropriate nulls
-        for key_field, _ in model_cls.key_fields_and_equality_operators:
+        for key_field, _ in key_pairs:
             key_col = getattr(model_cls, key_field)
 
             # build the query line, and prevent unintuitive null-y problems
@@ -156,7 +179,7 @@ class Writer:
 
         return query
 
-    def clear_key_period(self, key: dict[str, Any], free_period: TimeRange) -> None:
+    def clear_key_period(self, key: Key, free_period: TimeRange) -> None:
         """Free up values for the given key in application-time.
 
         For each record that overlaps with the given bitemporal key-space, we either:
@@ -171,7 +194,7 @@ class Writer:
             .all()
         )
         for record in overlaps:
-            stored_period: TimestamptzRange = record.app_period
+            stored_period = record.app_period
             original_period = TimeRange(
                 stored_period.lower,
                 stored_period.upper,
@@ -193,8 +216,8 @@ class Writer:
                 split = self.session.execute(
                     sql.text(
                         _get_split_record_call(
-                            schema=self.model_cls.__table__.schema,
-                            tablename=self.model_cls.__tablename__,
+                            schema=self._table.schema,
+                            tablename=self._table.name,
                         )
                     ).bindparams(
                         app_period_1=TimestamptzRange(
@@ -209,7 +232,8 @@ class Writer:
                             bounds=("(" if free_period.upper_inc else "[")
                             + ("]" if original_period.upper_inc else ")"),
                         ),
-                        row_id=record.row_id,
+                        # text: split_record casts it to the row_id column's type
+                        row_id=str(record.row_id),
                     )
                 ).scalar()
                 if not split:
@@ -222,21 +246,21 @@ class Writer:
             # free_period:   [----
             # kept       : [-)
             if original_period.starts_before(free_period):
-                record.app_period = TimestamptzRange(
-                    lower=original_period.lower,
-                    upper=free_period.lower,
-                    bounds=("[" if original_period.lower_inc else "(")
-                    + (")" if free_period.lower_inc else "]"),
+                record.app_period = _range(
+                    original_period.lower,
+                    free_period.lower,
+                    lower_inc=original_period.lower_inc,
+                    upper_inc=not free_period.lower_inc,
                 )
             else:
                 # app_period :   [---)
                 # free_period: [--)
                 # kept       :     [-)
-                record.app_period = TimestamptzRange(
-                    lower=free_period.upper,
-                    upper=original_period.upper,
-                    bounds=("(" if free_period.upper_inc else "[")
-                    + ("]" if original_period.upper_inc else ")"),
+                record.app_period = _range(
+                    free_period.upper,
+                    original_period.upper,
+                    lower_inc=not free_period.upper_inc,
+                    upper_inc=original_period.upper_inc,
                 )
 
         self.session.flush()
