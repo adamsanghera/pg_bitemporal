@@ -488,3 +488,84 @@ def test_backdating_names_both_times(session):
     assert isinstance(orig, psycopg.Error)
     hint = orig.diag.message_hint or ""
     assert hint.startswith("Transaction time only moves forward")
+
+
+def _raw_pair(session, history_columns: str) -> None:
+    """A current table and a hand-written history table with its own column order."""
+    session.execute(
+        text(
+            """
+            CREATE TABLE swap (
+                row_id bigserial PRIMARY KEY,
+                app_period tstzrange NOT NULL,
+                txn_period tstzrange NOT NULL DEFAULT tstzrange(now(), NULL),
+                user_id int NOT NULL,
+                street text NOT NULL,
+                note text
+            )
+            """
+        )
+    )
+    session.execute(text(f"CREATE TABLE swap_history ({history_columns})"))
+    session.execute(
+        text(
+            "CREATE TRIGGER versioning_trigger BEFORE INSERT OR UPDATE OR DELETE "
+            "ON swap FOR EACH ROW EXECUTE PROCEDURE record_txn_history('swap_history')"
+        )
+    )
+
+
+@pytest.fixture
+def raw_tables(session):
+    yield session
+    session.rollback()
+    session.execute(text("DROP TABLE IF EXISTS swap, swap_history"))
+    session.commit()
+
+
+def _insert_and_update_swap(session) -> None:
+    _write_at(
+        session,
+        JAN_1,
+        lambda: session.execute(
+            text(
+                "INSERT INTO swap (app_period, user_id, street, note) "
+                "VALUES ('[2022-01-01Z,)', 1, '123 Apple St', 'first')"
+            )
+        ),
+    )
+    _write_at(
+        session,
+        JUN_20,
+        lambda: session.execute(text("UPDATE swap SET street = '456 Banana St'")),
+    )
+
+
+def test_history_copy_matches_columns_by_name(raw_tables):
+    """A history table with columns in another order still gets the right values."""
+    session = raw_tables
+    _raw_pair(
+        session,
+        "note text, street text NOT NULL, user_id int NOT NULL, "
+        "txn_period tstzrange NOT NULL, app_period tstzrange NOT NULL, "
+        "row_id bigint NOT NULL",
+    )
+    _insert_and_update_swap(session)
+
+    row = session.execute(
+        text("SELECT street, note, user_id, txn_period FROM swap_history")
+    ).one()
+    assert (row.street, row.note, row.user_id) == ("123 Apple St", "first", 1)
+    assert (row.txn_period.lower, row.txn_period.upper) == (JAN_1, JUN_20)
+
+
+def test_history_copy_refuses_to_drop_a_column(raw_tables):
+    """A current column with nowhere to go in history fails instead of vanishing."""
+    session = raw_tables
+    _raw_pair(
+        session,
+        "row_id bigint, app_period tstzrange, txn_period tstzrange, "
+        "user_id int, street text",
+    )
+    with pytest.raises(DBAPIError, match=r"swap_history has no column for \{note\}"):
+        _insert_and_update_swap(session)
