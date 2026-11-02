@@ -1,5 +1,9 @@
 # Overview
 
+pg_bitemporal keeps a bitemporal history of a Postgres table: what was true when
+(application time), and what the database believed when (transaction time). The
+heavy lifting is a trigger in Postgres, with bindings for SQLAlchemy and Django.
+
 SQLAlchemy support:
 
 - not "production-ready"
@@ -7,6 +11,110 @@ SQLAlchemy support:
 Django support:
 
 - totally experimental
+
+## Install
+
+```
+pip install "pg_bitemporal[sqlalchemy]"   # or [django]
+```
+
+Python 3.13+ and PostgreSQL 14+. The install SQL creates the `btree_gist` and
+`hstore` extensions, so the role that runs it needs `CREATE` on the database (or
+create the two extensions beforehand as a superuser).
+
+Install the functions before creating any bitemporal table, since each table's
+trigger calls them. From Python, `install_functions(engine)`. From a shell or a
+migration tool, the same SQL is printed by:
+
+```
+python -m pg_bitemporal | psql <database>
+```
+
+The script replaces every function, so rerun it after upgrading.
+
+## Quickstart
+
+The bank example from below, end to end:
+
+```python
+from datetime import UTC, datetime
+
+from psycopg.types.range import TimestamptzRange
+from sqlalchemy import Column, Integer, String, create_engine, text
+from sqlalchemy.orm import Session
+
+from pg_bitemporal.sqlalchemy import install_functions
+from pg_bitemporal.sqlalchemy.base import CurrentBase, HistoryBase, to_history_table
+from pg_bitemporal.sqlalchemy.writer import TimeRange, Writer
+
+
+class AddressMixin:
+    # The bitemporal key: one row per user for any instant of application time.
+    key_fields_and_equality_operators = [("user_id", "=")]
+    user_id = Column(Integer, nullable=False)
+    street = Column(String, nullable=False)
+
+
+class Address(AddressMixin, CurrentBase):
+    pass
+
+
+AddressHistory = to_history_table(Address, [AddressMixin])
+
+engine = create_engine("postgresql+psycopg:///bank")
+install_functions(engine)  # extensions, trigger, and helpers; safe to rerun
+CurrentBase.metadata.create_all(engine)
+HistoryBase.metadata.create_all(engine)
+
+
+def day(month: int, d: int) -> datetime:
+    return datetime(2022, month, d, tzinfo=UTC)
+
+
+def recorded_on(session: Session, when: datetime) -> None:
+    """Pin this transaction's clock, so the example's transaction times are tidy."""
+    session.execute(text("SELECT set_transaction_time(:when)"), {"when": when})
+
+
+with Session(engine) as session:
+    # Jan 1: the customer signs up, living at Apple St.
+    recorded_on(session, day(1, 1))
+    session.add(
+        Address(
+            user_id=42,
+            street="123 Apple St",
+            app_period=TimestamptzRange(day(1, 1), None),
+        )
+    )
+    session.commit()
+
+    # Jun 20: they call to say they moved to Banana St on Jun 13.
+    recorded_on(session, day(6, 20))
+    writer = Writer(Address, session)
+    writer.clear_key_period({"user_id": 42}, TimeRange(day(6, 13), None))
+    session.add(
+        Address(
+            user_id=42,
+            street="456 Banana St",
+            app_period=TimestamptzRange(day(6, 13), None),
+        )
+    )
+    session.commit()
+
+    # Where did they live on Jun 15? Ask what the bank believed on Jun 19 and Jun 21.
+    key = {"user_id": 42}
+    print(writer.as_of(key, app_time=day(6, 15), txn_time=day(6, 19)).street)
+    print(writer.as_of(key, app_time=day(6, 15), txn_time=day(6, 21)).street)
+```
+
+```
+123 Apple St
+456 Banana St
+```
+
+On Jun 19 the bank still believed Apple St for Jun 15, which is why the checkbook
+went there. The `address_history` table keeps that belief, with its `txn_period`
+closed at Jun 20.
 
 # Bitemporal Data Theory
 
@@ -138,8 +246,18 @@ executes when the root table changes. The SQLAlchemy and Django libs instantiate
 trigger as part of the model definition.
 
 There are two other functions that are helpers for manipulating `record_txn_history`.
-One forces the observed "wall clock" to some constant value, while another allows
-the application to temporarily disable history-tracking within the scope of a transaction.
+`set_transaction_time(t)` forces the observed "wall clock" to some constant value, and
+`toggle_record_history(false)` temporarily disables history-tracking. Both last until
+the end of the current transaction, commit or rollback, and pass `NULL` or `true` to
+undo them sooner. They keep their state in the transaction-local settings
+`pg_bitemporal.txn_time` and `pg_bitemporal.history_disabled`.
+
+Transaction time only moves forward: writing a row at a time earlier than its last
+write raises an error.
+
+`record_txn_history` copies retired rows into the history table by column name, so
+the history table's columns can be in any order. It refuses a current-table column
+that the history table lacks, rather than dropping it.
 
 A final function is a helper for splitting a single "application span" (i.e. a row in
 the current table) into two distinct periods. This is used when clearing space to
