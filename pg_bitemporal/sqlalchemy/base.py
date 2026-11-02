@@ -223,7 +223,7 @@ def _build_history_table(current: Table, key: list[tuple[str, str]]) -> Table:
             "CREATE TRIGGER versioning_trigger "
             f"BEFORE INSERT OR UPDATE OR DELETE ON {_qualified(current)} "
             "FOR EACH ROW EXECUTE PROCEDURE "
-            f"public.record_txn_history('{_qualified(history)}')"
+            f"public.record_txn_history({_trigger_args(history, key)})"
         ),
     )
     return history
@@ -273,6 +273,12 @@ def _map_history_model(
     event.listen(history_cls, "before_update", refuse("update"))
     event.listen(history_cls, "before_delete", refuse("delete from"))
     return history_cls
+
+
+def _trigger_args(history: Table, key: list[tuple[str, str]]) -> str:
+    """The history table, then the key columns, as SQL string literals."""
+    values = [_qualified(history), *(name for name, _ in key)]
+    return ", ".join("'" + value.replace("'", "''") + "'" for value in values)
 
 
 def _qualified(table: Table) -> str:

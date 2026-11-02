@@ -458,7 +458,7 @@ def test_pinning_while_history_is_off_says_why(session):
 def test_backdating_names_both_times(session):
     uid = 23
     _record_apple(session, uid)
-    with pytest.raises(DBAPIError, match="is before this row's last write") as info:
+    with pytest.raises(DBAPIError, match="is before this key's last write") as info:
         _write_at(session, BEFORE_APP, lambda: _set_street(session, uid, "Nope"))
     orig = info.value.orig
     assert isinstance(orig, psycopg.Error)

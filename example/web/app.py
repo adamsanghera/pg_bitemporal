@@ -228,7 +228,7 @@ def explain(exc: BaseException) -> tuple[str, str]:
     orig = getattr(exc, "orig", None)
     detail = f"{orig}\n{exc}" if orig is not None else str(exc)
     lowered = detail.lower()
-    if "before this row's last write" in lowered:
+    if "before this key's last write" in lowered:
         return (
             "backdated",
             "The ledger refused. Something in this period was already written "

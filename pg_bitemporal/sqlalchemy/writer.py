@@ -7,12 +7,17 @@ from datetime import datetime
 from typing import Literal
 
 from psycopg.types.range import TimestamptzRange
-from sqlalchemy import Table, sql
-from sqlalchemy.dialects.postgresql import Range
+from sqlalchemy import Table, Text, sql
+from sqlalchemy.dialects.postgresql import ARRAY, Range
 from sqlalchemy.exc import MultipleResultsFound, NoResultFound
 from sqlalchemy.orm import Query, Session, class_mapper
 
 from pg_bitemporal.sqlalchemy.base import Bitemporal, BitemporalHistory, bitemporal_key
+
+
+def _qualified_name(table: Table) -> str:
+    name = f'"{table.name}"'
+    return f'"{table.schema}".{name}' if table.schema is not None else name
 
 
 def _get_split_record_call(schema: str | None, tablename: str) -> str:
@@ -119,6 +124,39 @@ class Writer[ModelT: Bitemporal[object]]:
             raise ValueError("`model_cls` must be a mapped Bitemporal model")
         self._table = table
 
+    def lock_key(self, key: Key) -> None:
+        """Lock ``key`` until the session's transaction ends.
+
+        Every write locks its key anyway, inside the trigger. Call this first when a
+        transaction writes several keys: lock all of them, in sorted order, before
+        writing any. Otherwise a key that another transaction writes in between makes
+        this one fail with a serialization failure (SQLSTATE 40001), to be retried.
+        It also makes reads of ``key`` before the first write see the latest version.
+        """
+        pairs = bitemporal_key(self.model_cls)
+        missing = {name for name, _ in pairs} - key.keys()
+        if missing:
+            raise ValueError(f"Missing values for bitemporal key: {missing}")
+        params: dict[str, object] = {}
+        casts = []
+        for i, (name, _) in enumerate(pairs):
+            casts.append(f"CAST(:v{i} AS text)")
+            params[f"v{i}"] = key[name]
+        names = [name for name, _ in pairs]
+        statement = sql.text(
+            "SELECT public.lock_bitemporal_key("
+            f"populate_record(NULL::{_qualified_name(self._table)}, "
+            f"hstore(CAST(:names AS text[]), ARRAY[{', '.join(casts)}])), "
+            "CAST(:names AS text[]))"
+        ).bindparams(
+            sql.bindparam("names", names, type_=ARRAY(Text)),
+            *(
+                sql.bindparam(f"v{i}", type_=self._table.c[name].type)
+                for i, (name, _) in enumerate(pairs)
+            ),
+        )
+        self.session.execute(statement, params)
+
     def query_key(self, key: Key) -> Query[ModelT]:
         """Build a query into the current table of a model, given a bitemporal key."""
         return self._query_key(self.model_cls, key)
@@ -187,6 +225,8 @@ class Writer[ModelT: Bitemporal[object]]:
             2. Partition the record into two distinct application periods.
             3. Trim the application period's prefix or suffix.
         """
+        # Lock before reading, so the rows read are the latest committed versions.
+        self.lock_key(key)
         # Load first. Deleting or updating while the query streams skips rows.
         overlaps = (
             self.query_key(key=key)
