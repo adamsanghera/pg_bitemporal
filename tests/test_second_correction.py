@@ -5,14 +5,12 @@ database. When unset, the test uses ``postgresql+psycopg:///pg_bitemporal_test``
 creates that database if the server is up.
 """
 
-import os
 import re
 import uuid
 from datetime import UTC, datetime, timedelta
 
 import psycopg
 import pytest
-from psycopg import OperationalError as PsycopgOperationalError
 from psycopg.types.range import TimestamptzRange
 from sqlalchemy import (
     DateTime,
@@ -20,14 +18,11 @@ from sqlalchemy import (
     String,
     Table,
     bindparam,
-    create_engine,
-    event,
     func,
     inspect,
     text,
 )
-from sqlalchemy.engine.url import make_url
-from sqlalchemy.exc import DBAPIError, NoResultFound, OperationalError
+from sqlalchemy.exc import DBAPIError, NoResultFound
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from pg_bitemporal.sqlalchemy import install_functions
@@ -93,67 +88,10 @@ _CURRENT = _ident(Address.__tablename__)
 _HISTORY = _ident(AddressHistory.__tablename__)
 
 
-def _test_url() -> str:
-    return os.environ.get(
-        "PG_BITEMPORAL_TEST_URL", "postgresql+psycopg:///pg_bitemporal_test"
-    )
-
-
-def _ensure_database(url: str) -> None:
-    parsed = make_url(url)
-    dbname = parsed.database
-    if dbname is None or not dbname.isidentifier():
-        raise RuntimeError(
-            "PG_BITEMPORAL_TEST_URL must name a simple database to create"
-        )
-
-    admin = create_engine(parsed.set(database="postgres"), isolation_level="AUTOCOMMIT")
-    try:
-        with admin.connect() as conn:
-            exists = conn.execute(
-                text("SELECT 1 FROM pg_database WHERE datname = :name"),
-                {"name": dbname},
-            ).scalar()
-            if exists:
-                return
-            conn.execute(text(f'CREATE DATABASE "{dbname}"'))
-    finally:
-        admin.dispose()
-
-
-def _rebuild(engine) -> None:
-    with engine.begin() as conn:
-        conn.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
-        conn.execute(text("CREATE SCHEMA public"))
-    install_functions(engine)
-    _Base.metadata.create_all(engine)
-
-
 @pytest.fixture(scope="module")
-def engine():
+def engine(make_engine):
     """Create the bitemporal tables against the test database."""
-    url = _test_url()
-    try:
-        _ensure_database(url)
-    except (OperationalError, PsycopgOperationalError) as exc:
-        pytest.skip(f"PostgreSQL is not reachable at {url}: {exc}")
-
-    engine = create_engine(url)
-
-    @event.listens_for(engine, "connect")
-    def _utc(dbapi_connection, _record):
-        cursor = dbapi_connection.cursor()
-        cursor.execute("SET TIME ZONE 'UTC'")
-        cursor.close()
-
-    try:
-        _rebuild(engine)
-    except (OperationalError, PsycopgOperationalError) as exc:
-        engine.dispose()
-        pytest.skip(f"PostgreSQL is not reachable at {url}: {exc}")
-
-    yield engine
-    engine.dispose()
+    return make_engine(_Base.metadata)
 
 
 @pytest.fixture
@@ -520,7 +458,7 @@ def test_pinning_while_history_is_off_says_why(session):
 def test_backdating_names_both_times(session):
     uid = 23
     _record_apple(session, uid)
-    with pytest.raises(DBAPIError, match="is before this row's last write") as info:
+    with pytest.raises(DBAPIError, match="is before this key's last write") as info:
         _write_at(session, BEFORE_APP, lambda: _set_street(session, uid, "Nope"))
     orig = info.value.orig
     assert isinstance(orig, psycopg.Error)

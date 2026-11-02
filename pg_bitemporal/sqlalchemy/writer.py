@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import datetime
 from typing import Literal
 
 from psycopg.types.range import TimestamptzRange
-from sqlalchemy import Table, sql
-from sqlalchemy.dialects.postgresql import Range
+from sqlalchemy import Table, Text, sql
+from sqlalchemy.dialects.postgresql import ARRAY, Range
 from sqlalchemy.exc import MultipleResultsFound, NoResultFound
 from sqlalchemy.orm import Query, Session, class_mapper
 
 from pg_bitemporal.sqlalchemy.base import Bitemporal, BitemporalHistory, bitemporal_key
+
+
+def _qualified_name(table: Table) -> str:
+    name = f'"{table.name}"'
+    return f'"{table.schema}".{name}' if table.schema is not None else name
 
 
 def _get_split_record_call(schema: str | None, tablename: str) -> str:
@@ -119,6 +124,52 @@ class Writer[ModelT: Bitemporal[object]]:
             raise ValueError("`model_cls` must be a mapped Bitemporal model")
         self._table = table
 
+    def lock_keys(self, keys: Iterable[Key]) -> None:
+        """Lock every key in ``keys`` until the session's transaction ends.
+
+        One statement, however many keys. Postgres takes the locks in its own fixed
+        order, so the order of ``keys`` doesn't matter and two transactions locking
+        overlapping keys queue rather than deadlock.
+
+        Every write locks its own key inside the trigger. Call this first when a
+        transaction writes several keys: otherwise a key that another transaction
+        writes in between makes this one fail with a serialization failure
+        (SQLSTATE 40001), to be retried.
+        """
+        keys = list(keys)
+        if not keys:
+            return
+        names = [name for name, _ in bitemporal_key(self.model_cls)]
+        for key in keys:
+            missing = set(names) - key.keys()
+            if missing:
+                raise ValueError(f"Missing values for bitemporal key: {missing}")
+
+        # One array per key column, unnested in parallel into rows of the table.
+        # Each value is cast through its column's type, so the lock id matches the
+        # one the trigger computes from a stored row.
+        columns = [f"c{i}" for i in range(len(names))]
+        statement = sql.text(
+            "SELECT public.lock_bitemporal_keys(ARRAY("
+            f"SELECT populate_record(NULL::{_qualified_name(self._table)}, "
+            "hstore(CAST(:names AS text[]), "
+            f"ARRAY[{', '.join(f'CAST(k.{c} AS text)' for c in columns)}])) "
+            f"FROM unnest({', '.join(f':{c}' for c in columns)}) "
+            f"AS k({', '.join(columns)})"
+            "), CAST(:names AS text[]))"
+        ).bindparams(
+            sql.bindparam("names", names, type_=ARRAY(Text)),
+            *(
+                sql.bindparam(
+                    column,
+                    [key[name] for key in keys],
+                    type_=ARRAY(self._table.c[name].type),
+                )
+                for column, name in zip(columns, names, strict=True)
+            ),
+        )
+        self.session.execute(statement)
+
     def query_key(self, key: Key) -> Query[ModelT]:
         """Build a query into the current table of a model, given a bitemporal key."""
         return self._query_key(self.model_cls, key)
@@ -187,6 +238,8 @@ class Writer[ModelT: Bitemporal[object]]:
             2. Partition the record into two distinct application periods.
             3. Trim the application period's prefix or suffix.
         """
+        # Lock first: the first read is part of the critical region.
+        self.lock_keys([key])
         # Load first. Deleting or updating while the query streams skips rows.
         overlaps = (
             self.query_key(key=key)

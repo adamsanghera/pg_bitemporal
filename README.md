@@ -169,7 +169,7 @@ the end of the current transaction, commit or rollback, and pass `NULL` or `true
 undo them sooner. They keep their state in the transaction-local settings
 `pg_bitemporal.txn_time` and `pg_bitemporal.history_disabled`.
 
-Transaction time only moves forward: writing a row at a time earlier than its last
+Transaction time only moves forward: writing a key at a time earlier than its last
 write raises an error.
 
 `record_txn_history` copies retired rows into the history table by column name, so

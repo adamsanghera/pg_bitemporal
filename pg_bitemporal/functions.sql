@@ -10,7 +10,8 @@ CREATE EXTENSION IF NOT EXISTS hstore;
 -- `set_config` in a session, and '' after a reset.
 
 -- force the transaction time for the sql transaction to be a particular timestamptz.
--- Pass NULL to go back to CURRENT_TIMESTAMP.
+-- Pass NULL to unpin it: the next write then takes the clock, as described at
+-- `bitemporal_transaction_time`.
 CREATE OR REPLACE FUNCTION public.set_transaction_time (fixed_time timestamptz)
     RETURNS bool
     AS $$
@@ -25,12 +26,7 @@ BEGIN
         RAISE EXCEPTION 'set_transaction_time needs a finite time, got %', fixed_time;
     END IF;
 
-    -- ISO 8601 in UTC reads back exactly whatever DateStyle and TimeZone are.
-    PERFORM
-        set_config('pg_bitemporal.txn_time',
-            coalesce(to_char(fixed_time AT TIME ZONE 'UTC',
-                'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'), ''),
-            true);
+    PERFORM public._pin_transaction_time(fixed_time, 'user');
     RETURN TRUE;
 END;
 $$ LANGUAGE plpgsql;
@@ -51,6 +47,118 @@ END;
 $$
 LANGUAGE plpgsql;
 
+
+-- Pin (or, with NULL, unpin) this transaction's time. `pinned_by` records who did it:
+-- 'user' for set_transaction_time, 'lock' for the first write after taking its locks.
+-- ISO 8601 in UTC reads back exactly whatever DateStyle and TimeZone are.
+CREATE OR REPLACE FUNCTION public._pin_transaction_time (fixed_time timestamptz, pinned_by text)
+    RETURNS void
+    AS $$
+BEGIN
+    PERFORM
+        set_config('pg_bitemporal.txn_time',
+            coalesce(to_char(fixed_time AT TIME ZONE 'UTC',
+                'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'), ''),
+            true);
+    PERFORM
+        set_config('pg_bitemporal.txn_time_pinned_by',
+            CASE WHEN fixed_time IS NULL THEN '' ELSE pinned_by END, true);
+END;
+$$ LANGUAGE plpgsql;
+
+-- This transaction's time: the pinned time if there is one. Otherwise the clock,
+-- pinned so that every later write in the transaction shares it.
+--
+-- The trigger calls this only after locking the keys it writes. So a transaction that
+-- waited for another to release a key reads the clock after that one committed, and its
+-- time sorts after the other's writes. CURRENT_TIMESTAMP, the transaction's start, can
+-- be earlier than a write that committed while this transaction was waiting.
+CREATE OR REPLACE FUNCTION public.bitemporal_transaction_time ()
+    RETURNS timestamptz
+    AS $$
+DECLARE
+    pinned text := nullif(current_setting('pg_bitemporal.txn_time', true), '');
+    now_ timestamptz;
+BEGIN
+    IF (pinned IS NOT NULL) THEN
+        RETURN pinned::timestamptz;
+    END IF;
+    now_ := clock_timestamp();
+    PERFORM public._pin_transaction_time(now_, 'lock');
+    RETURN now_;
+END;
+$$ LANGUAGE plpgsql;
+
+-- The advisory lock id for `row_value`'s key: a hash of the table and the typed key
+-- values, so it does not depend on DateStyle or TimeZone. `row_value` is a row of the
+-- current table, and only its key columns are read. Two keys that happen to share a
+-- hash only make each other wait.
+CREATE OR REPLACE FUNCTION public._bitemporal_lock_id (row_value anyelement, key_columns text[])
+    RETURNS bigint
+    AS $$
+DECLARE
+    lock_id bigint;
+BEGIN
+    EXECUTE format('SELECT hash_record_extended(ROW(%s::oid, %s), 0)',
+        pg_typeof(row_value)::text::regclass::oid,
+        (SELECT string_agg(format('($1).%I', col), ', ') FROM unnest(key_columns) AS col))
+    INTO lock_id
+    USING row_value;
+    RETURN lock_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Lock one bitemporal key until the transaction ends. The trigger passes OLD or NEW.
+CREATE OR REPLACE FUNCTION public.lock_bitemporal_key (row_value anyelement, key_columns text[])
+    RETURNS void
+    AS $$
+BEGIN
+    PERFORM pg_advisory_xact_lock(public._bitemporal_lock_id(row_value, key_columns));
+END;
+$$ LANGUAGE plpgsql;
+
+-- Lock several keys of one table until the transaction ends, in one call. The locks are
+-- taken in lock-id order, so two transactions locking overlapping sets queue on the
+-- first key they share instead of deadlocking, whatever order the caller listed them.
+-- Writer.lock_keys builds `row_values` from the keys' values.
+CREATE OR REPLACE FUNCTION public.lock_bitemporal_keys (row_values anyarray, key_columns text[])
+    RETURNS void
+    AS $$
+DECLARE
+    lock_id bigint;
+BEGIN
+    FOR lock_id IN
+        SELECT DISTINCT public._bitemporal_lock_id(r, key_columns)
+        FROM unnest(row_values) AS r
+        ORDER BY 1
+    LOOP
+        PERFORM pg_advisory_xact_lock(lock_id);
+    END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+
+-- The latest transaction time at which any version of `row_value`'s key was written:
+-- a current row's start, or a history row's end. NULL for a key never written.
+CREATE OR REPLACE FUNCTION public._bitemporal_key_last_write (
+    row_value anyelement, history_table regclass, key_columns text[])
+    RETURNS timestamptz
+    AS $$
+DECLARE
+    matches text;
+    last_write timestamptz;
+BEGIN
+    SELECT string_agg(format('t.%1$I = ($1).%1$I', col), ' AND ') INTO matches
+    FROM unnest(key_columns) AS col;
+    EXECUTE format(
+        'SELECT greatest('
+        '(SELECT max(lower(txn_period)) FROM %1$s AS t WHERE %3$s), '
+        '(SELECT max(upper(txn_period)) FROM %2$s AS t WHERE %3$s))',
+        pg_typeof(row_value)::text::regclass, history_table, matches)
+    INTO last_write
+    USING row_value;
+    RETURN last_write;
+END;
+$$ LANGUAGE plpgsql;
 
 -- `record_txn_history` turns `update` and `delete` into non-destructive mutations.
 --
@@ -75,8 +183,16 @@ LANGUAGE plpgsql;
 -- * Sometimes, we want to "freeze" the transaction time ourselves. Either for testing
 --   reasons or for application reasons. `set_transaction_time` stores it in the
 --   transaction-local setting `pg_bitemporal.txn_time`.
--- * When setting the old transaction period to the measured timestamp, it is possible
---   for the period to post-date the measured timestamp. In this case, we barf.
+-- * Arguments after the history table name are the key's columns. With them, the
+--   trigger locks each key it writes (`lock_bitemporal_key`) before reading the
+--   transaction time, and checks the time against the key's latest write in either
+--   table. A trigger created with only the history table (before keys were passed)
+--   takes no lock and checks against OLD alone.
+-- * A transaction time earlier than the key's latest write is refused. If
+--   set_transaction_time pinned it, that's backdating. If the clock pinned it, another
+--   transaction wrote the key after this one's time was fixed by an earlier write: a
+--   serialization failure (40001), which the caller retries. Locking every key first
+--   (lock_bitemporal_keys) prevents it.
 -- * It is sometimes helpful to pause history tracking, if we want to make a migration
 --   without impacting history (although this is obviously discouraged).
 --   `toggle_record_history` sets the transaction-local `pg_bitemporal.history_disabled`.
@@ -85,17 +201,18 @@ CREATE OR REPLACE FUNCTION public.record_txn_history ()
     AS $$
 DECLARE
     measured_time timestamptz;
-    fixed_time text;
     old_values hstore;
     history_columns text[];
     unmatched text[];
+    key_columns text[];
+    last_write timestamptz;
 BEGIN
-    -- validate the argument (the transaction history table)
-    -- TODO: validate table exists; although we'll raise further down if it doesn't.
-    IF (tg_nargs != 1) THEN
-        RAISE EXCEPTION 'record_txn_history expects 1 argument'
-            USING hint = 'history table name required';
+    -- arguments: the history table, then the key's columns
+    IF (tg_nargs < 1) THEN
+        RAISE EXCEPTION 'record_txn_history expects the history table name'
+            USING hint = 'Pass the history table, then the key columns.';
     END IF;
+    key_columns := TG_ARGV[1:tg_nargs - 1];
 
     -- early-exit if trigger is disabled
     IF (coalesce(current_setting('pg_bitemporal.history_disabled', true), '') <> '') THEN
@@ -110,9 +227,45 @@ BEGIN
         END IF;
     END IF;
 
-    -- measure time from either fixed value (if set) or current_timestamp.
-    fixed_time := nullif(current_setting('pg_bitemporal.txn_time', true), '');
-    measured_time := coalesce(fixed_time::timestamptz, CURRENT_TIMESTAMP);
+    -- Lock the keys first, then read the time, so a wait for another writer comes
+    -- before this transaction's time is fixed. An UPDATE may move a row between keys.
+    IF (cardinality(key_columns) > 0) THEN
+        IF (tg_op IN ('UPDATE', 'DELETE')) THEN
+            PERFORM public.lock_bitemporal_key(OLD, key_columns);
+        END IF;
+        IF (tg_op IN ('INSERT', 'UPDATE')) THEN
+            PERFORM public.lock_bitemporal_key(NEW, key_columns);
+        END IF;
+    END IF;
+
+    measured_time := public.bitemporal_transaction_time();
+
+    -- Refuse a time earlier than the key's latest write. Equal is this transaction.
+    IF (cardinality(key_columns) > 0) THEN
+        last_write := greatest(
+            CASE WHEN tg_op IN ('UPDATE', 'DELETE') THEN
+                public._bitemporal_key_last_write(OLD, TG_ARGV[0]::regclass, key_columns)
+            END,
+            CASE WHEN tg_op IN ('INSERT', 'UPDATE') THEN
+                public._bitemporal_key_last_write(NEW, TG_ARGV[0]::regclass, key_columns)
+            END);
+    ELSIF (tg_op IN ('UPDATE', 'DELETE')) THEN
+        last_write := lower(OLD.txn_period);
+    END IF;
+
+    IF (measured_time < last_write) THEN
+        IF (current_setting('pg_bitemporal.txn_time_pinned_by', true) = 'user') THEN
+            RAISE EXCEPTION 'transaction time % is before this key''s last write at %',
+                measured_time, last_write
+                USING hint = 'Transaction time only moves forward. Pass '
+                    'set_transaction_time a time no earlier than the key''s last write.';
+        END IF;
+        RAISE EXCEPTION 'another transaction wrote this key at %, after this '
+            'transaction''s time %', last_write, measured_time
+            USING errcode = 'serialization_failure',
+                hint = 'Retry the transaction. To avoid this, lock every key the '
+                    'transaction writes before writing any of them (Writer.lock_keys).';
+    END IF;
 
     -- insert: very simple! new row beginning at current time.
     -- no need to update `old`, since it does not exist.
@@ -122,12 +275,7 @@ BEGIN
     END IF;
 
     -- not an insert, so we may truncate `old.txn_period`
-    IF (measured_time < lower(OLD.txn_period)) THEN
-        RAISE EXCEPTION 'transaction time % is before this row''s last write at %',
-            measured_time, lower(OLD.txn_period)
-            USING hint = 'Transaction time only moves forward. If set_transaction_time '
-                'pinned it, pass a time no earlier than the row''s last write.';
-        elsif (measured_time = lower(OLD.txn_period)) THEN
+    IF (measured_time = lower(OLD.txn_period)) THEN
             -- We don't need to persist data that's replaced in the *same DB transaction*,
             -- so we allow it to either be deleted or replaced with the latest value.
         ELSE
