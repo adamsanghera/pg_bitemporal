@@ -1,5 +1,10 @@
 # Overview
 
+pg_bitemporal keeps a bitemporal history of a Postgres table: what was true when
+(application time), and what the database believed when (transaction time). A
+Postgres trigger records the history. SQLAlchemy and Django bindings define the
+tables and query them.
+
 SQLAlchemy support:
 
 - not "production-ready"
@@ -7,6 +12,26 @@ SQLAlchemy support:
 Django support:
 
 - totally experimental
+
+## Install
+
+```
+pip install "pg_bitemporal[sqlalchemy]"   # or [django]
+```
+
+Python 3.13+ and PostgreSQL 14+. The install SQL creates the `btree_gist` and
+`hstore` extensions, so the role that runs it needs `CREATE` on the database (or
+create the two extensions beforehand as a superuser).
+
+Install the functions before creating any bitemporal table, since each table's
+trigger calls them. From Python, `install_functions(engine)`. From a shell or a
+migration tool, the same SQL is printed by:
+
+```
+python -m pg_bitemporal | psql <database>
+```
+
+The script replaces every function, so rerun it after upgrading.
 
 # Bitemporal Data Theory
 
@@ -138,8 +163,18 @@ executes when the root table changes. The SQLAlchemy and Django libs instantiate
 trigger as part of the model definition.
 
 There are two other functions that are helpers for manipulating `record_txn_history`.
-One forces the observed "wall clock" to some constant value, while another allows
-the application to temporarily disable history-tracking within the scope of a transaction.
+`set_transaction_time(t)` forces the observed "wall clock" to some constant value, and
+`toggle_record_history(false)` temporarily disables history-tracking. Both last until
+the end of the current transaction, commit or rollback, and pass `NULL` or `true` to
+undo them sooner. They keep their state in the transaction-local settings
+`pg_bitemporal.txn_time` and `pg_bitemporal.history_disabled`.
+
+Transaction time only moves forward: writing a row at a time earlier than its last
+write raises an error.
+
+`record_txn_history` copies retired rows into the history table by column name, so
+the history table's columns can be in any order. It refuses a current-table column
+that the history table lacks, rather than dropping it.
 
 A final function is a helper for splitting a single "application span" (i.e. a row in
 the current table) into two distinct periods. This is used when clearing space to
