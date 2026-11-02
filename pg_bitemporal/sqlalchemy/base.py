@@ -1,6 +1,7 @@
 """Root mixins and base class for bitemporal tables."""
 
 import re
+from typing import Any
 
 from sqlalchemy import DDL, event, exc, func
 from sqlalchemy.dialects.postgresql import TSTZRANGE, ExcludeConstraint
@@ -132,6 +133,15 @@ class _HistoryBase(BaseMixin):
 CurrentBase = declarative_base(cls=_CurrentBase)
 HistoryBase = declarative_base(cls=_HistoryBase)
 
+# Each current model's history model, filled in by `to_history_table`. Keeping the
+# pairing here means nothing is written onto the caller's class.
+_history_classes: dict[type, type[Any]] = {}
+
+
+def history_class_of(current_model_cls: type) -> type[Any] | None:
+    """Return the history model built for ``current_model_cls``, if any."""
+    return _history_classes.get(current_model_cls)
+
 
 def to_history_table(current_model_cls, mixin_classes: list):
     """Generate a history table for a given 'current' table'.
@@ -146,20 +156,32 @@ def to_history_table(current_model_cls, mixin_classes: list):
     >>> class Foo(FooMixin, CurrentBase):
     ...     pass
     ...
-    >>> generate_history_table(Foo, FooMixin)
+    >>> FooHistory = to_history_table(Foo, [FooMixin])
+
+    Calling it again for the same model returns the same history class.
 
     NOTE: This makes the assumption that the history table definition never changes
     at runtime. This assumption holds as long as `mixin_classes` and `current_model_cls`
     do not change at runtime, which should be a pretty safe assumption for most apps.
     If this is not true for you, create the history table declaratively in your model.
     """
+    existing = history_class_of(current_model_cls)
+    if existing is not None:
+        return existing
+
     history_model_cls_name = f"{current_model_cls.__name__}History"
     try:
         history_model_cls = type(
             history_model_cls_name, (*(mixin_classes), HistoryBase), {}
         )
     except exc.InvalidRequestError:
-        return HistoryBase.metadata.tables[to_snakecase(history_model_cls_name)]
+        # The table was mapped elsewhere (e.g. a module imported twice). Hand back
+        # that mapped class, so callers always get a class and never a Table.
+        tablename = to_snakecase(history_model_cls_name)
+        for mapper in HistoryBase.registry.mappers:
+            if mapper.local_table.name == tablename:
+                return mapper.class_
+        raise
 
     @event.listens_for(history_model_cls, "before_update")
     def history_update_listener(mapper, connection, target):
@@ -167,13 +189,13 @@ def to_history_table(current_model_cls, mixin_classes: list):
 
     @event.listens_for(history_model_cls, "before_insert")
     def history_insert_listener(mapper, connection, target):
-        raise ValueError("May not insert into {target.__table__.fullname}")
+        raise ValueError(f"May not insert into {target.__table__.fullname}")
 
     @event.listens_for(history_model_cls, "before_delete")
     def history_delete_listener(mapper, connection, target):
-        raise ValueError("May not delete from {target.__table__.fullname}")
+        raise ValueError(f"May not delete from {target.__table__.fullname}")
 
-    current_model_cls.history_class = history_model_cls
+    _history_classes[current_model_cls] = history_model_cls
     history_model_cls.__table__.add_is_dependent_on(current_model_cls.__table__)
     event.listen(
         history_model_cls.__table__,

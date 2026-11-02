@@ -27,7 +27,12 @@ from sqlalchemy.engine.url import make_url
 from sqlalchemy.exc import NoResultFound, OperationalError
 from sqlalchemy.orm import sessionmaker
 
-from pg_bitemporal.sqlalchemy.base import CurrentBase, HistoryBase, to_history_table
+from pg_bitemporal.sqlalchemy.base import (
+    CurrentBase,
+    HistoryBase,
+    history_class_of,
+    to_history_table,
+)
 from pg_bitemporal.sqlalchemy.writer import TimeRange, Writer
 
 JAN_1 = datetime(2022, 1, 1, tzinfo=UTC)
@@ -372,3 +377,38 @@ def test_as_of_raises_when_no_row_contains_both_times(session, user_id):
         writer.as_of({"user_id": user_id}, app_time=JUN_1, txn_time=BEFORE_APP)
     with pytest.raises(NoResultFound):
         writer.as_of({"user_id": user_id + 1}, app_time=JUN_1, txn_time=JAN_15)
+
+
+def test_to_history_table_returns_the_same_class_when_called_again():
+    """A second call hands back the mapped class, never a bare Table."""
+    assert to_history_table(Address, [_AddressMixin]) is AddressHistory
+    assert history_class_of(Address) is AddressHistory
+    assert not hasattr(Address, "history_class")
+
+
+@pytest.mark.parametrize(
+    ("verb", "mutate"),
+    [
+        ("insert into", lambda s, row: s.add(AddressHistory(**row))),
+        ("update", lambda s, row: setattr(row, "street", "999 Elm St")),
+        ("delete from", lambda s, row: s.delete(row)),
+    ],
+)
+def test_orm_writes_to_history_name_the_table(session, user_id, verb, mutate):
+    """The ORM refuses history writes, and the message names the history table."""
+    if verb == "insert into":
+        target = {
+            "user_id": 999,
+            "street": "1 Nowhere",
+            "app_period": APP_PERIOD,
+            "txn_period": TimestamptzRange(JAN_1, JUN_1),
+        }
+    else:
+        target = (
+            session.query(AddressHistory)
+            .filter(AddressHistory.user_id == user_id)
+            .first()
+        )
+    mutate(session, target)
+    with pytest.raises(ValueError, match=f"^May not {verb} {_HISTORY}$"):
+        session.flush()

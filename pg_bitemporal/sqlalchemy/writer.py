@@ -9,7 +9,7 @@ from psycopg.types.range import TimestamptzRange
 from sqlalchemy import orm, sql
 from sqlalchemy.exc import MultipleResultsFound, NoResultFound
 
-from pg_bitemporal.sqlalchemy.base import CurrentBase
+from pg_bitemporal.sqlalchemy.base import CurrentBase, history_class_of
 
 
 def _get_split_record_call(schema: str, tablename: str):
@@ -104,7 +104,7 @@ class Writer:
         included and the upper bound is not. Exactly one current or history
         row must match.
         """
-        history_cls = getattr(self.model_cls, "history_class", None)
+        history_cls = history_class_of(self.model_cls)
         if history_cls is None:
             raise ValueError(
                 f"{self.model_cls.__name__} has no history table. "
