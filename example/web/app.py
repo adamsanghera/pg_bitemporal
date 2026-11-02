@@ -31,7 +31,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from psycopg import OperationalError as PsycopgOperationalError
-from psycopg.types.range import Range, TimestamptzRange
+from psycopg.types.range import Range
 from sqlalchemy import (
     DateTime,
     String,
@@ -336,11 +336,11 @@ def record_belief(
     written_on: datetime,
 ) -> None:
     period = TimeRange(true_from, true_until)
-    stored = TimestamptzRange(true_from, true_until)
 
     def mutate(session: Session) -> None:
-        Writer(Residence, session).clear_key_period({"person": person}, period)
-        session.add(Residence(person=person, street=street, app_period=stored))
+        Writer(Residence, session).clear_and_record(
+            {"person": person}, {"street": street}, period
+        )
 
     write_at(written_on, mutate)
 
