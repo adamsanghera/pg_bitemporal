@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
-from typing import Any, Literal
+from typing import Literal
 
 from psycopg.types.range import TimestamptzRange
-from sqlalchemy import orm, sql
+from sqlalchemy import Table, sql
 from sqlalchemy.dialects.postgresql import Range
 from sqlalchemy.exc import MultipleResultsFound, NoResultFound
+from sqlalchemy.orm import Query, Session, class_mapper
 
-from pg_bitemporal.sqlalchemy.base import Bitemporal, bitemporal_key
+from pg_bitemporal.sqlalchemy.base import Bitemporal, BitemporalHistory, bitemporal_key
 
 
-def _get_split_record_call(schema: str, tablename: str):
+def _get_split_record_call(schema: str | None, tablename: str) -> str:
     full_name = f'"{schema}"."{tablename}"' if schema is not None else f'"{tablename}"'
 
     return (
@@ -101,38 +103,45 @@ def _range(
     return Range(lower, upper, bounds=_BOUNDS[lower_inc, upper_inc])
 
 
-class Writer:
+# A key maps each key column to its value, whatever the column's type.
+Key = Mapping[str, object]
+
+
+class Writer[ModelT: Bitemporal[object]]:
     """Queries and mutations for a current table and its history table."""
 
-    def __init__(self, model_cls, session):
-        if not (isinstance(model_cls, type) and issubclass(model_cls, Bitemporal)):
-            raise ValueError(
-                f"`model_cls` must be a mapped {Bitemporal.__name__} model"
-            )
-
-        self.model_cls = model_cls
+    def __init__(self, model_cls: type[ModelT], session: Session) -> None:
+        self.model_cls: type[ModelT] = model_cls
         self.session = session
+        # Checked at runtime too, for callers without a type checker.
+        table = class_mapper(model_cls).local_table
+        if not (issubclass(model_cls, Bitemporal) and isinstance(table, Table)):
+            raise ValueError("`model_cls` must be a mapped Bitemporal model")
+        self._table = table
 
-    def query_key(self, key: dict[str, Any]) -> orm.query.Query:
+    def query_key(self, key: Key) -> Query[ModelT]:
         """Build a query into the current table of a model, given a bitemporal key."""
         return self._query_key(self.model_cls, key)
 
-    def as_of(self, key: dict[str, Any], *, app_time: datetime, txn_time: datetime):
+    def as_of(
+        self, key: Key, *, app_time: datetime, txn_time: datetime
+    ) -> ModelT | BitemporalHistory:
         """Return the belief for ``key`` that contains both instants.
 
         ``app_time`` is when the fact was true. ``txn_time`` is when the
         database believed it. Periods are half-open: the lower bound is
         included and the upper bound is not. Exactly one current or history
-        row must match.
+        row must match. It is a current-model or a history-model instance.
         """
-        found = []
-        for model_cls in (self.model_cls, self.model_cls.__history_model__):
-            found.extend(
-                self._query_key(model_cls, key)
-                .filter(model_cls.app_period.contains(app_time))
-                .filter(model_cls.txn_period.contains(txn_time))
-                .all()
-            )
+        current, history = self.model_cls, self.model_cls.__history_model__
+        found: list[ModelT | BitemporalHistory] = [
+            *self._query_key(current, key)
+            .filter(current.app_period.contains(app_time))
+            .filter(current.txn_period.contains(txn_time)),
+            *self._query_key(history, key)
+            .filter(history.app_period.contains(app_time))
+            .filter(history.txn_period.contains(txn_time)),
+        ]
         if not found:
             raise NoResultFound(
                 f"no belief for {key} at app {app_time} as of txn {txn_time}"
@@ -143,7 +152,7 @@ class Writer:
             )
         return found[0]
 
-    def _query_key(self, model_cls, key: dict[str, Any]) -> orm.query.Query:
+    def _query_key[R](self, model_cls: type[R], key: Key) -> Query[R]:
         query = self.session.query(model_cls)
 
         # validate bitemporal key is a complete key. The history model shares the
@@ -170,7 +179,7 @@ class Writer:
 
         return query
 
-    def clear_key_period(self, key: dict[str, Any], free_period: TimeRange) -> None:
+    def clear_key_period(self, key: Key, free_period: TimeRange) -> None:
         """Free up values for the given key in application-time.
 
         For each record that overlaps with the given bitemporal key-space, we either:
@@ -207,8 +216,8 @@ class Writer:
                 split = self.session.execute(
                     sql.text(
                         _get_split_record_call(
-                            schema=self.model_cls.__table__.schema,
-                            tablename=self.model_cls.__tablename__,
+                            schema=self._table.schema,
+                            tablename=self._table.name,
                         )
                     ).bindparams(
                         app_period_1=TimestamptzRange(

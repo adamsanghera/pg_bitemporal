@@ -79,7 +79,8 @@ def bitemporal_key(model_cls: type) -> list[tuple[str, str]]:
 
 # The row_id type. A model that redeclares row_id as, say, a uuid names it here
 # (`Bitemporal[uuid.UUID]`), so the override type-checks. Plain `Bitemporal` is int.
-RowIdT = TypeVar("RowIdT", default=int)
+# Covariant, so code that takes any model can ask for `Bitemporal[object]`.
+RowIdT = TypeVar("RowIdT", default=int, covariant=True)
 
 
 class BitemporalHistory:

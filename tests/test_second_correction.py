@@ -207,6 +207,7 @@ def _street(session, user_id: int, *, txn_time, app_time) -> str:
     belief = Writer(Address, session).as_of(
         {"user_id": user_id}, app_time=app_time, txn_time=txn_time
     )
+    assert isinstance(belief, (Address, AddressHistory))
     return belief.street
 
 
