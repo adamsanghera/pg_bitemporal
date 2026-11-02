@@ -1,6 +1,7 @@
 """Root mixins and base class for bitemporal tables."""
 
 import re
+from typing import Any
 
 from sqlalchemy import DDL, event, exc, func
 from sqlalchemy.dialects.postgresql import TSTZRANGE, ExcludeConstraint
@@ -132,6 +133,15 @@ class _HistoryBase(BaseMixin):
 CurrentBase = declarative_base(cls=_CurrentBase)
 HistoryBase = declarative_base(cls=_HistoryBase)
 
+# Each current model's history model, filled in by `to_history_table`. Keeping the
+# pairing here means nothing is written onto the caller's class.
+_history_classes: dict[type, type[Any]] = {}
+
+
+def history_class_of(current_model_cls: type) -> type[Any] | None:
+    """Return the history model built for ``current_model_cls``, if any."""
+    return _history_classes.get(current_model_cls)
+
 
 def to_history_table(current_model_cls, mixin_classes: list):
     """Generate a history table for a given 'current' table'.
@@ -155,7 +165,7 @@ def to_history_table(current_model_cls, mixin_classes: list):
     do not change at runtime, which should be a pretty safe assumption for most apps.
     If this is not true for you, create the history table declaratively in your model.
     """
-    existing = current_model_cls.__dict__.get("history_class")
+    existing = history_class_of(current_model_cls)
     if existing is not None:
         return existing
 
@@ -185,7 +195,7 @@ def to_history_table(current_model_cls, mixin_classes: list):
     def history_delete_listener(mapper, connection, target):
         raise ValueError(f"May not delete from {target.__table__.fullname}")
 
-    current_model_cls.history_class = history_model_cls
+    _history_classes[current_model_cls] = history_model_cls
     history_model_cls.__table__.add_is_dependent_on(current_model_cls.__table__)
     event.listen(
         history_model_cls.__table__,

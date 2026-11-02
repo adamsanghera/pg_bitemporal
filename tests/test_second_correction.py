@@ -27,7 +27,12 @@ from sqlalchemy.engine.url import make_url
 from sqlalchemy.exc import NoResultFound, OperationalError
 from sqlalchemy.orm import sessionmaker
 
-from pg_bitemporal.sqlalchemy.base import CurrentBase, HistoryBase, to_history_table
+from pg_bitemporal.sqlalchemy.base import (
+    CurrentBase,
+    HistoryBase,
+    history_class_of,
+    to_history_table,
+)
 from pg_bitemporal.sqlalchemy.writer import TimeRange, Writer
 
 JAN_1 = datetime(2022, 1, 1, tzinfo=UTC)
@@ -377,6 +382,8 @@ def test_as_of_raises_when_no_row_contains_both_times(session, user_id):
 def test_to_history_table_returns_the_same_class_when_called_again():
     """A second call hands back the mapped class, never a bare Table."""
     assert to_history_table(Address, [_AddressMixin]) is AddressHistory
+    assert history_class_of(Address) is AddressHistory
+    assert not hasattr(Address, "history_class")
 
 
 @pytest.mark.parametrize(
