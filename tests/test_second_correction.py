@@ -620,3 +620,86 @@ def test_a_declared_history_model_must_match_the_columns():
             __bitemporal_key__ = ("name",)
             __history_model__ = WrongHistory
             name: Mapped[str]
+
+
+def test_clear_and_record_writes_the_bank_example(session):
+    """Sign up at Apple St, then record the move to Banana St from Jun 13."""
+    uid = 30
+    writer = Writer(Address, session)
+    _write_at(
+        session,
+        JAN_1,
+        lambda: writer.clear_and_record(
+            {"user_id": uid}, {"street": "123 Apple St"}, TimeRange(JAN_1, None)
+        ),
+    )
+    _write_at(
+        session,
+        JUN_20,
+        lambda: writer.clear_and_record(
+            {"user_id": uid}, {"street": "456 Banana St"}, TimeRange(JUN_13, None)
+        ),
+    )
+
+    assert _street(session, uid, txn_time=JUN_19, app_time=JUN_14) == "123 Apple St"
+    assert _street(session, uid, txn_time=JUN_21, app_time=JUN_14) == "456 Banana St"
+    assert _street(session, uid, txn_time=JUN_21, app_time=JUN_1) == "123 Apple St"
+
+
+def test_clear_and_record_inside_a_period_leaves_both_sides(session):
+    """A short stay in the middle splits the old belief around the new one."""
+    uid = 31
+    writer = Writer(Address, session)
+    _write_at(
+        session,
+        JAN_1,
+        lambda: writer.clear_and_record(
+            {"user_id": uid}, {"street": "123 Apple St"}, TimeRange(JAN_1, None)
+        ),
+    )
+    _write_at(
+        session,
+        JUN_20,
+        lambda: writer.clear_and_record(
+            {"user_id": uid}, {"street": "456 Banana St"}, TimeRange(JUN_13, JUN_19)
+        ),
+    )
+
+    current = (
+        session.query(Address)
+        .filter(Address.user_id == uid)
+        .order_by(Address.app_period)
+        .all()
+    )
+    assert [
+        (row.street, row.app_period.lower, row.app_period.upper) for row in current
+    ] == [
+        ("123 Apple St", JAN_1, JUN_13),
+        ("456 Banana St", JUN_13, JUN_19),
+        ("123 Apple St", JUN_19, None),
+    ]
+
+
+def test_clear_and_record_returns_the_new_row(session):
+    row = Writer(Address, session).clear_and_record(
+        {"user_id": 32}, {"street": "1 Oak St"}, TimeRange(JAN_1, None)
+    )
+    assert row.row_id is not None
+    assert (row.user_id, row.street) == (32, "1 Oak St")
+    assert row.app_period.lower == JAN_1
+
+
+@pytest.mark.parametrize(
+    ("values", "message"),
+    [
+        ({"street": "x", "user_id": 9}, r"may not set \['user_id'\]"),
+        ({"street": "x", "app_period": None}, r"may not set \['app_period'\]"),
+        ({"stret": "x"}, r"has no columns \['stret'\]"),
+    ],
+)
+def test_clear_and_record_checks_values_before_writing(session, values, message):
+    with pytest.raises(ValueError, match=message):
+        Writer(Address, session).clear_and_record(
+            {"user_id": 33}, values, TimeRange(JAN_1, None)
+        )
+    assert session.query(Address).filter(Address.user_id == 33).count() == 0

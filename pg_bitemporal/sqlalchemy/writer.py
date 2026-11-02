@@ -317,3 +317,44 @@ class Writer[ModelT: Bitemporal[object]]:
                 )
 
         self.session.flush()
+
+    def clear_and_record(
+        self, key: Key, values: Mapping[str, object], app_period: TimeRange
+    ) -> ModelT:
+        """Clear ``key`` over ``app_period``, then record ``values`` for that period.
+
+        This is how a new fact is written: whatever was believed about ``key``
+        during ``app_period`` is retired (trimmed, split, or deleted, as in
+        ``clear_key_period``), and one row holding ``values`` takes its place.
+        Belief outside ``app_period`` is left alone. Returns the new row, flushed
+        but not committed.
+
+        ``values`` names the model's other columns. The key, ``row_id``, and the
+        two periods are set here and may not appear in it.
+        """
+        key_names = {name for name, _ in bitemporal_key(self.model_cls)}
+        reserved = key_names | {"row_id", "app_period", "txn_period"}
+        clashes = reserved & values.keys()
+        if clashes:
+            raise ValueError(f"`values` may not set {sorted(clashes)}")
+        unknown = values.keys() - self._table.c.keys()
+        if unknown:
+            raise ValueError(
+                f"{self.model_cls.__name__} has no columns {sorted(unknown)}"
+            )
+
+        self.clear_key_period(key, app_period)
+        row = self.model_cls()
+        for name in key_names:
+            setattr(row, name, key[name])
+        for name, value in values.items():
+            setattr(row, name, value)
+        row.app_period = _range(
+            app_period.lower,
+            app_period.upper,
+            lower_inc=app_period.lower_inc,
+            upper_inc=app_period.upper_inc,
+        )
+        self.session.add(row)
+        self.session.flush()
+        return row
