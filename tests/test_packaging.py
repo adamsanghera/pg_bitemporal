@@ -8,8 +8,15 @@ from pg_bitemporal import functions_sql
 
 def test_functions_sql_is_packaged():
     sql = functions_sql()
+    assert sql.startswith("-- Exclusion constraints on the key need btree_gist")
     assert "CREATE EXTENSION IF NOT EXISTS btree_gist" in sql
-    assert "FUNCTION public.record_txn_history" in sql
+    for function in (
+        "set_transaction_time",
+        "lock_bitemporal_keys",
+        "record_txn_history",
+        "split_record",
+    ):
+        assert f"FUNCTION public.{function}" in sql
 
 
 def test_module_prints_the_install_sql():
