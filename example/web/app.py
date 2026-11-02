@@ -33,7 +33,6 @@ from urllib.parse import parse_qs, urlparse
 from psycopg import OperationalError as PsycopgOperationalError
 from psycopg.types.range import Range, TimestamptzRange
 from sqlalchemy import (
-    Column,
     DateTime,
     String,
     bindparam,
@@ -45,10 +44,10 @@ from sqlalchemy import (
 from sqlalchemy.engine import Engine
 from sqlalchemy.engine.url import make_url
 from sqlalchemy.exc import MultipleResultsFound, NoResultFound, OperationalError
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from pg_bitemporal.sqlalchemy import install_functions
-from pg_bitemporal.sqlalchemy.base import CurrentBase, HistoryBase, to_history_table
+from pg_bitemporal.sqlalchemy.base import Bitemporal
 from pg_bitemporal.sqlalchemy.writer import TimeRange, Writer
 
 DEFAULT_URL = "postgresql+psycopg://127.0.0.1:5432/pg_bitemporal_example"
@@ -96,17 +95,18 @@ SessionFactory: sessionmaker[Session] | None = None
 _capture = threading.local()
 
 
-class ResidenceMixin:
-    key_fields_and_equality_operators = [("person", "=")]
-    person = Column(String, nullable=False)
-    street = Column(String, nullable=False)
-
-
-class Residence(ResidenceMixin, CurrentBase):
+class Base(DeclarativeBase):
     pass
 
 
-ResidenceHistory = to_history_table(Residence, [ResidenceMixin])
+class Residence(Bitemporal, Base):
+    __tablename__ = "residence"
+    __bitemporal_key__ = ("person",)
+    person: Mapped[str] = mapped_column(String)
+    street: Mapped[str] = mapped_column(String)
+
+
+ResidenceHistory = Residence.__history__
 
 
 class Invalid(ValueError):
@@ -298,8 +298,7 @@ def boot(url: str) -> None:
             log.append(show_sql(statement, parameters))
 
     install_functions(engine)
-    CurrentBase.metadata.create_all(engine)
-    HistoryBase.metadata.create_all(engine)
+    Base.metadata.create_all(engine)
     ENGINE = engine
     SessionFactory = sessionmaker(bind=engine, autoflush=False)
     known = set(people())

@@ -1,211 +1,194 @@
-"""Root mixins and base class for bitemporal tables."""
+"""The ``Bitemporal`` mixin: declare a model bitemporal on your own declarative base.
 
-import re
-from typing import Any
+>>> class Base(DeclarativeBase):
+...     pass
+...
+>>> class Address(Bitemporal, Base):
+...     __tablename__ = "address"
+...     __bitemporal_key__ = ("user_id",)
+...     user_id: Mapped[int]
+...     street: Mapped[str]
+...
+>>> Address.__history__        # AddressHistory, mapped to "address_history"
+>>> Base.metadata.create_all(engine)   # both tables, and the versioning trigger
 
-from sqlalchemy import DDL, event, exc, func
+The mixin adds ``row_id``, ``app_period`` and ``txn_period``, the key's exclusion
+constraint and indexes, and a history model built from the finished table. The
+history model is read-only through the ORM: rows reach it only via the trigger.
+"""
+
+from __future__ import annotations
+
+from typing import Any, ClassVar
+
+from sqlalchemy import (
+    BigInteger,
+    Column,
+    Index,
+    Table,
+    UniqueConstraint,
+    event,
+    func,
+)
 from sqlalchemy.dialects.postgresql import TSTZRANGE, ExcludeConstraint
-from sqlalchemy.orm import declarative_base, declared_attr
-from sqlalchemy.schema import Index, UniqueConstraint
-from sqlalchemy.sql import schema, sqltypes
+from sqlalchemy.orm import Mapped, class_mapper, mapped_column
+from sqlalchemy.schema import DDL
+
+__all__ = ["Bitemporal", "bitemporal_key"]
 
 
-def get_time_period_column(is_pk):
-    """Build an application or transaction period column."""
-    return schema.Column(
-        TSTZRANGE,
-        nullable=False,
-        primary_key=is_pk,
-        server_default=func.tstzrange(func.now(), None),
+def _period_column() -> Mapped[Any]:
+    return mapped_column(
+        TSTZRANGE, nullable=False, server_default=func.tstzrange(func.now(), None)
     )
 
 
-def to_snakecase(name):
-    return re.sub("(?<!^)(?=[A-Z])", "_", name).lower()
+def bitemporal_key(model_cls: type) -> list[tuple[str, str]]:
+    """Return ``model_cls``'s key as ``(column, exclusion operator)`` pairs.
 
-
-class BaseMixin:
-    """Base mixin for bitemporal models."""
-
-    # The list of fields that make up the "bitemporal key" for the model, which is
-    # semantically similar to a "Primary Key". This is the set of values that is unique
-    # for a point in app time + txn time.
-    key_fields_and_equality_operators: list[tuple[str, str]] = []
-
-    # Primary Key for any bitemporal model; needs to be distinct from the bitemporal
-    # key, because the bitemporal key is not unique within the scope of the table.
-    # UUID is acceptable, too, IMO. `row_id` is a stylistic choice.
-    row_id = schema.Column(sqltypes.BIGINT, primary_key=True, autoincrement=True)
-
-
-class _CurrentBase(BaseMixin):
-    """Mixin for 'current' table, i.e. values that have not been expired."""
-
-    # the time dimension relevant to the application.
-    app_period = get_time_period_column(is_pk=False)
-
-    # the time dimension relevant to the "transaction" i.e. persistence in `current`
-    txn_period = get_time_period_column(is_pk=False)
-
-    @declared_attr.directive
-    def __tablename__(cls: type) -> str:
-        return to_snakecase(cls.__name__)
-
-    @declared_attr.directive
-    def __table_args__(cls) -> tuple:
-        return (
-            # unique constraint on (*bitmeporal_key, app_period), to allow for FKs
-            UniqueConstraint(
-                *(key_field for key_field, _ in cls.key_fields_and_equality_operators),
-                "app_period",
-                name=f"{cls.__tablename__}_bitemporal_unique_key",
-            ),
-            # rows with identical bitemporal-key values can overlap on `app_period`
-            ExcludeConstraint(
-                *(
-                    (key_field, op)
-                    for key_field, op in cls.key_fields_and_equality_operators
-                ),
-                ("app_period", "&&"),
-                name=f"{cls.__tablename__}_bitemporal_key_exclusion",
-            ),
-            # indices for bitemporal-key
-            *(
-                Index(f"{cls.__tablename__}_{key_field}_idx", key_field)
-                for key_field, _ in cls.key_fields_and_equality_operators
-            ),
-            # indices for bitemporal fields
-            *(
-                Index(
-                    f"{cls.__tablename__}_{period}_idx", period, postgresql_using="gist"
-                )
-                for period in ("app_period", "txn_period")
-            ),
-        )
-
-
-class _HistoryBase(BaseMixin):
-    """Mixin for 'history' table, i.e. values that have been expired."""
-
-    # the time dimension relevant to the application.
-    app_period = get_time_period_column(is_pk=False)
-
-    # the time dimension relevant to the "transaction" i.e. persistence in `current`
-    # this period joins the PK with `row_id`, because there can be duplicate `row_id`
-    # keys in the history table; otherwise, it wouldn't be a very useful history table!
-    txn_period = get_time_period_column(is_pk=True)
-
-    @declared_attr.directive
-    def __tablename__(cls: type) -> str:
-        return to_snakecase(cls.__name__)
-
-    @declared_attr.directive
-    def __table_args__(cls) -> tuple:
-        return (
-            # No unique constraint: a correction retires the previous belief, so
-            # history rows for one key share `app_period` and differ in `txn_period`.
-            # Exclude a row only when both periods overlap. Adjacent transaction
-            # ranges do not overlap, which is what lets the next correction land.
-            ExcludeConstraint(
-                *(
-                    (key_field, op)
-                    for key_field, op in cls.key_fields_and_equality_operators
-                ),
-                ("app_period", "&&"),
-                ("txn_period", "&&"),
-                name=f"{cls.__tablename__}_bitemporal_key_exclusion",
-            ),
-            # indices for bitemporal-key
-            *(
-                Index(f"{cls.__tablename__}_{key_field}_idx", key_field)
-                for key_field, _ in cls.key_fields_and_equality_operators
-            ),
-            # indices for bitemporal fields
-            *(
-                Index(
-                    f"{cls.__tablename__}_{period}_idx", period, postgresql_using="gist"
-                )
-                for period in ("app_period", "txn_period")
-            ),
-        )
-
-
-CurrentBase = declarative_base(cls=_CurrentBase)
-HistoryBase = declarative_base(cls=_HistoryBase)
-
-# Each current model's history model, filled in by `to_history_table`. Keeping the
-# pairing here means nothing is written onto the caller's class.
-_history_classes: dict[type, type[Any]] = {}
-
-
-def history_class_of(current_model_cls: type) -> type[Any] | None:
-    """Return the history model built for ``current_model_cls``, if any."""
-    return _history_classes.get(current_model_cls)
-
-
-def to_history_table(current_model_cls, mixin_classes: list):
-    """Generate a history table for a given 'current' table'.
-
-    You can do all of this declaratively, but it's not recommended, because it's easy
-    to make a mistake! Instead, do something like this:
-
-    >>> class FooMixin:
-    ...     key_fields_and_equality_operators = [("foo_id", "=")]
-    ...     foo_id = Column(UUID)
-    ...
-    >>> class Foo(FooMixin, CurrentBase):
-    ...     pass
-    ...
-    >>> FooHistory = to_history_table(Foo, [FooMixin])
-
-    Calling it again for the same model returns the same history class.
-
-    NOTE: This makes the assumption that the history table definition never changes
-    at runtime. This assumption holds as long as `mixin_classes` and `current_model_cls`
-    do not change at runtime, which should be a pretty safe assumption for most apps.
-    If this is not true for you, create the history table declaratively in your model.
+    ``__bitemporal_key__`` is a tuple of column names, compared with ``=``, or a
+    dict from column name to the operator to exclude on (``{"tags": "&&"}``).
     """
-    existing = history_class_of(current_model_cls)
-    if existing is not None:
-        return existing
-
-    history_model_cls_name = f"{current_model_cls.__name__}History"
-    try:
-        history_model_cls = type(
-            history_model_cls_name, (*(mixin_classes), HistoryBase), {}
+    key = getattr(model_cls, "__bitemporal_key__", None)
+    if isinstance(key, dict):
+        pairs = list(key.items())
+    elif isinstance(key, (tuple, list)):
+        pairs = [(name, "=") for name in key]
+    else:
+        raise TypeError(
+            f"{model_cls.__name__} must set __bitemporal_key__ to a tuple of column "
+            "names, or a dict from column name to exclusion operator"
         )
-    except exc.InvalidRequestError:
-        # The table was mapped elsewhere (e.g. a module imported twice). Hand back
-        # that mapped class, so callers always get a class and never a Table.
-        tablename = to_snakecase(history_model_cls_name)
-        for mapper in HistoryBase.registry.mappers:
-            if mapper.local_table.name == tablename:
-                return mapper.class_
-        raise
+    if not pairs:
+        raise TypeError(f"{model_cls.__name__}.__bitemporal_key__ is empty")
+    return pairs
 
-    @event.listens_for(history_model_cls, "before_update")
-    def history_update_listener(mapper, connection, target):
-        raise ValueError(f"May not update {target.__table__.fullname}")
 
-    @event.listens_for(history_model_cls, "before_insert")
-    def history_insert_listener(mapper, connection, target):
-        raise ValueError(f"May not insert into {target.__table__.fullname}")
+class Bitemporal:
+    """Mixin for a bitemporal model. Put it before your declarative base."""
 
-    @event.listens_for(history_model_cls, "before_delete")
-    def history_delete_listener(mapper, connection, target):
-        raise ValueError(f"May not delete from {target.__table__.fullname}")
+    __bitemporal_key__: ClassVar[tuple[str, ...] | dict[str, str]]
+    __history__: ClassVar[type[Any]]
 
-    _history_classes[current_model_cls] = history_model_cls
-    history_model_cls.__table__.add_is_dependent_on(current_model_cls.__table__)
+    # Primary key. The bitemporal key repeats across app periods, so it can't be one.
+    row_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+
+    # When the fact was true.
+    app_period: Mapped[Any] = _period_column()
+
+    # When the database believed it. The trigger sets it on every write.
+    txn_period: Mapped[Any] = _period_column()
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        # The declarative base maps the class inside this super() call, so the
+        # table exists afterwards.
+        super().__init_subclass__(**kwargs)
+        table = cls.__dict__.get("__table__")
+        if not isinstance(table, Table):
+            return  # abstract, or single-table inheritance off a bitemporal parent
+        key = bitemporal_key(cls)
+        _add_current_constraints(table, key)
+        cls.__history__ = _build_history(cls, table, key)
+
+
+def _key_indexes(table: Table, key: list[tuple[str, str]]) -> None:
+    for name, _ in key:
+        Index(f"{table.name}_{name}_idx", table.c[name])
+    for period in ("app_period", "txn_period"):
+        Index(f"{table.name}_{period}_idx", table.c[period], postgresql_using="gist")
+
+
+def _add_current_constraints(table: Table, key: list[tuple[str, str]]) -> None:
+    names = [name for name, _ in key]
+    # (key, app_period) is unique, so other tables can reference a version.
+    table.append_constraint(
+        UniqueConstraint(
+            *names, "app_period", name=f"{table.name}_bitemporal_unique_key"
+        )
+    )
+    # One version per key at any instant of application time.
+    table.append_constraint(
+        ExcludeConstraint(
+            *key, ("app_period", "&&"), name=f"{table.name}_bitemporal_key_exclusion"
+        )
+    )
+    _key_indexes(table, key)
+
+
+def _build_history(
+    current_cls: type, current: Table, key: list[tuple[str, str]]
+) -> type[Any]:
+    # Same columns by name and type. No defaults, foreign keys, or unique flags:
+    # history rows are copies, and what they referenced may since have gone.
+    # (row_id, txn_period) is the key, since history repeats a row_id per version.
+    history = Table(
+        f"{current.name}_history",
+        current.metadata,
+        *(
+            Column(
+                col.name,
+                col.type,
+                nullable=col.nullable,
+                primary_key=col.name in ("row_id", "txn_period"),
+                autoincrement=False,
+            )
+            for col in current.columns
+        ),
+        # A correction retires the previous belief, so history rows for one key
+        # share app_period and differ in txn_period. Exclude a row only when both
+        # periods overlap: adjacent transaction ranges don't, which is what lets
+        # the next correction land.
+        ExcludeConstraint(
+            *key,
+            ("app_period", "&&"),
+            ("txn_period", "&&"),
+            name=f"{current.name}_history_bitemporal_key_exclusion",
+        ),
+        schema=current.schema,
+    )
+    _key_indexes(history, key)
+    history.add_is_dependent_on(current)
     event.listen(
-        history_model_cls.__table__,
+        history,
         "after_create",
         DDL(
             "CREATE TRIGGER versioning_trigger "
-            f'BEFORE INSERT OR DELETE OR UPDATE ON "{current_model_cls.__tablename__}" '
+            f"BEFORE INSERT OR UPDATE OR DELETE ON {_qualified(current)} "
             "FOR EACH ROW EXECUTE PROCEDURE "
-            f"public.record_txn_history('{history_model_cls.__tablename__}')"
+            f"public.record_txn_history('{_qualified(history)}')"
         ),
     )
 
-    return history_model_cls
+    history_cls = type(
+        f"{current_cls.__name__}History",
+        (),
+        {
+            "__module__": current_cls.__module__,
+            "__doc__": f"Retired versions of {current_cls.__name__}. Read-only.",
+            "__tablename__": history.name,
+            "__init__": _assign_attributes,
+        },
+    )
+    # Same registry as the current model, so relationships and lookups work alike.
+    class_mapper(current_cls).registry.map_imperatively(history_cls, history)
+
+    def refuse(verb: str):
+        def listener(mapper, connection, target) -> None:
+            raise ValueError(f"May not {verb} {history.fullname}")
+
+        return listener
+
+    event.listen(history_cls, "before_insert", refuse("insert into"))
+    event.listen(history_cls, "before_update", refuse("update"))
+    event.listen(history_cls, "before_delete", refuse("delete from"))
+    return history_cls
+
+
+def _assign_attributes(self: Any, **values: Any) -> None:
+    for name, value in values.items():
+        setattr(self, name, value)
+
+
+def _qualified(table: Table) -> str:
+    name = f'"{table.name}"'
+    return f'"{table.schema}".{name}' if table.schema else name

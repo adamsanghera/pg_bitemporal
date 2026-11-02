@@ -9,7 +9,7 @@ from psycopg.types.range import TimestamptzRange
 from sqlalchemy import orm, sql
 from sqlalchemy.exc import MultipleResultsFound, NoResultFound
 
-from pg_bitemporal.sqlalchemy.base import CurrentBase, history_class_of
+from pg_bitemporal.sqlalchemy.base import Bitemporal, bitemporal_key
 
 
 def _get_split_record_call(schema: str, tablename: str):
@@ -86,8 +86,10 @@ class Writer:
     """Queries and mutations for a current table and its history table."""
 
     def __init__(self, model_cls, session):
-        if not issubclass(model_cls, CurrentBase):
-            raise ValueError(f"`model_cls` must be a child of {str(CurrentBase)}")
+        if not (isinstance(model_cls, type) and issubclass(model_cls, Bitemporal)):
+            raise ValueError(
+                f"`model_cls` must be a mapped {Bitemporal.__name__} model"
+            )
 
         self.model_cls = model_cls
         self.session = session
@@ -104,15 +106,8 @@ class Writer:
         included and the upper bound is not. Exactly one current or history
         row must match.
         """
-        history_cls = history_class_of(self.model_cls)
-        if history_cls is None:
-            raise ValueError(
-                f"{self.model_cls.__name__} has no history table. "
-                "Call to_history_table first."
-            )
-
         found = []
-        for model_cls in (self.model_cls, history_cls):
+        for model_cls in (self.model_cls, self.model_cls.__history__):
             found.extend(
                 self._query_key(model_cls, key)
                 .filter(model_cls.app_period.contains(app_time))
@@ -132,16 +127,16 @@ class Writer:
     def _query_key(self, model_cls, key: dict[str, Any]) -> orm.query.Query:
         query = self.session.query(model_cls)
 
-        # validate bitemporal key is a complete key
-        key_fields = set(
-            key_field for key_field, _ in model_cls.key_fields_and_equality_operators
-        )
+        # validate bitemporal key is a complete key. The history model shares the
+        # current model's key.
+        key_pairs = bitemporal_key(self.model_cls)
+        key_fields = {key_field for key_field, _ in key_pairs}
         missing_fields = key_fields - key.keys()
         if missing_fields:
             raise ValueError(f"Missing values for bitemporal key: {missing_fields}")
 
         # iterate through fields, applying filters. raise on inappropriate nulls
-        for key_field, _ in model_cls.key_fields_and_equality_operators:
+        for key_field, _ in key_pairs:
             key_col = getattr(model_cls, key_field)
 
             # build the query line, and prevent unintuitive null-y problems

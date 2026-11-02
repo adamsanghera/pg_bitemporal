@@ -14,26 +14,22 @@ import pytest
 from psycopg import OperationalError as PsycopgOperationalError
 from psycopg.types.range import TimestamptzRange
 from sqlalchemy import (
-    Column,
     DateTime,
     Integer,
     String,
+    Table,
     bindparam,
     create_engine,
     event,
+    inspect,
     text,
 )
 from sqlalchemy.engine.url import make_url
 from sqlalchemy.exc import DBAPIError, NoResultFound, OperationalError
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from pg_bitemporal.sqlalchemy import install_functions
-from pg_bitemporal.sqlalchemy.base import (
-    CurrentBase,
-    HistoryBase,
-    history_class_of,
-    to_history_table,
-)
+from pg_bitemporal.sqlalchemy.base import Bitemporal
 from pg_bitemporal.sqlalchemy.writer import TimeRange, Writer
 
 JAN_1 = datetime(2022, 1, 1, tzinfo=UTC)
@@ -57,17 +53,18 @@ APP_PERIOD = TimestamptzRange(JAN_1, None)
 _TIMESTAMPTZ = DateTime(timezone=True)
 
 
-class _AddressMixin:
-    key_fields_and_equality_operators = [("user_id", "=")]
-    user_id = Column(Integer, nullable=False)
-    street = Column(String, nullable=False)
-
-
-class Address(_AddressMixin, CurrentBase):
+class _Base(DeclarativeBase):
     pass
 
 
-AddressHistory = to_history_table(Address, [_AddressMixin])
+class Address(Bitemporal, _Base):
+    __tablename__ = "address"
+    __bitemporal_key__ = ("user_id",)
+    user_id: Mapped[int] = mapped_column(Integer)
+    street: Mapped[str] = mapped_column(String)
+
+
+AddressHistory = Address.__history__
 
 
 def _ident(name: str) -> str:
@@ -113,8 +110,7 @@ def _rebuild(engine) -> None:
         conn.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
         conn.execute(text("CREATE SCHEMA public"))
     install_functions(engine)
-    CurrentBase.metadata.create_all(engine)
-    HistoryBase.metadata.create_all(engine)
+    _Base.metadata.create_all(engine)
 
 
 @pytest.fixture(scope="module")
@@ -370,11 +366,46 @@ def test_as_of_raises_when_no_row_contains_both_times(session, user_id):
         writer.as_of({"user_id": user_id + 1}, app_time=JUN_1, txn_time=JAN_15)
 
 
-def test_to_history_table_returns_the_same_class_when_called_again():
-    """A second call hands back the mapped class, never a bare Table."""
-    assert to_history_table(Address, [_AddressMixin]) is AddressHistory
-    assert history_class_of(Address) is AddressHistory
-    assert not hasattr(Address, "history_class")
+def test_the_mixin_builds_a_history_model_on_the_same_metadata():
+    """Declaring the model is enough: its history is mapped beside it."""
+    history = inspect(AddressHistory).local_table
+    assert AddressHistory.__name__ == "AddressHistory"
+    assert history.name == "address_history"
+    assert history.metadata is _Base.metadata
+    assert [c.name for c in history.primary_key] == ["row_id", "txn_period"]
+    assert [c.name for c in history.columns] == [
+        c.name for c in inspect(Address).local_table.columns
+    ]
+
+
+def test_table_args_do_not_drop_the_bitemporal_constraints():
+    """The mixin adds its constraints to the table, so __table_args__ is free."""
+
+    class Base(DeclarativeBase):
+        pass
+
+    class Tagged(Bitemporal, Base):
+        __tablename__ = "tagged"
+        __table_args__ = {"comment": "mine"}
+        __bitemporal_key__ = {"label": "="}
+        label: Mapped[str]
+
+    table = inspect(Tagged).local_table
+    assert isinstance(table, Table)
+    names = {c.name for c in table.constraints}
+    assert {"tagged_bitemporal_unique_key", "tagged_bitemporal_key_exclusion"} <= names
+    assert table.comment == "mine"
+
+
+def test_a_model_without_a_key_is_refused():
+    class Base(DeclarativeBase):
+        pass
+
+    with pytest.raises(TypeError, match="must set __bitemporal_key__"):
+
+        class Keyless(Bitemporal, Base):
+            __tablename__ = "keyless"
+            name: Mapped[str]
 
 
 @pytest.mark.parametrize(
