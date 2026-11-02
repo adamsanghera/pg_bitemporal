@@ -1,7 +1,7 @@
 .PHONY: init check test
 
 init:
-	uv sync --all-groups
+	uv sync --all-groups --locked
 
 check:
 	uv run ruff check pg_bitemporal tests example

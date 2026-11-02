@@ -4,3 +4,5 @@
 *.egg-info/
 tmp-pg/
 dist/
+__pycache__/
+.ruff_cache/

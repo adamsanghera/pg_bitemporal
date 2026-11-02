@@ -6,14 +6,24 @@ readme = "README.md"
 requires-python = ">=3.13"
 authors = [{ name = "Adam", email = "adamsanghera@gmail.com" }]
 license = "MIT"
-dependencies = [
-    "django>=6.1",
-    "psycopg[binary]>=3.3",
+dependencies = []
+
+# Pick the ORM you use. psycopg is left without [binary] so the application chooses
+# how to install it; the dev group below uses the binary wheel.
+[project.optional-dependencies]
+sqlalchemy = [
+    "psycopg>=3.3",
     "sqlalchemy>=2.1",
+]
+django = [
+    "django>=6.1",
+    "psycopg>=3.3",
 ]
 
 [dependency-groups]
 dev = [
+    "pg_bitemporal[sqlalchemy,django]",
+    "psycopg[binary]>=3.3",
     "pytest>=9",
     "ruff>=0.17",
     "ty>=0.0.95",
