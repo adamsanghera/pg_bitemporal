@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import datetime
 from typing import Literal
 
@@ -124,38 +124,51 @@ class Writer[ModelT: Bitemporal[object]]:
             raise ValueError("`model_cls` must be a mapped Bitemporal model")
         self._table = table
 
-    def lock_key(self, key: Key) -> None:
-        """Lock ``key`` until the session's transaction ends.
+    def lock_keys(self, keys: Iterable[Key]) -> None:
+        """Lock every key in ``keys`` until the session's transaction ends.
 
-        Every write locks its key anyway, inside the trigger. Call this first when a
-        transaction writes several keys: lock all of them, in sorted order, before
-        writing any. Otherwise a key that another transaction writes in between makes
-        this one fail with a serialization failure (SQLSTATE 40001), to be retried.
-        It also makes reads of ``key`` before the first write see the latest version.
+        One statement, however many keys. Postgres takes the locks in its own fixed
+        order, so the order of ``keys`` doesn't matter and two transactions locking
+        overlapping keys queue rather than deadlock.
+
+        Every write locks its own key inside the trigger. Call this first when a
+        transaction writes several keys: otherwise a key that another transaction
+        writes in between makes this one fail with a serialization failure
+        (SQLSTATE 40001), to be retried.
         """
-        pairs = bitemporal_key(self.model_cls)
-        missing = {name for name, _ in pairs} - key.keys()
-        if missing:
-            raise ValueError(f"Missing values for bitemporal key: {missing}")
-        params: dict[str, object] = {}
-        casts = []
-        for i, (name, _) in enumerate(pairs):
-            casts.append(f"CAST(:v{i} AS text)")
-            params[f"v{i}"] = key[name]
-        names = [name for name, _ in pairs]
+        keys = list(keys)
+        if not keys:
+            return
+        names = [name for name, _ in bitemporal_key(self.model_cls)]
+        for key in keys:
+            missing = set(names) - key.keys()
+            if missing:
+                raise ValueError(f"Missing values for bitemporal key: {missing}")
+
+        # One array per key column, unnested in parallel into rows of the table.
+        # Each value is cast through its column's type, so the lock id matches the
+        # one the trigger computes from a stored row.
+        columns = [f"c{i}" for i in range(len(names))]
         statement = sql.text(
-            "SELECT public.lock_bitemporal_key("
-            f"populate_record(NULL::{_qualified_name(self._table)}, "
-            f"hstore(CAST(:names AS text[]), ARRAY[{', '.join(casts)}])), "
-            "CAST(:names AS text[]))"
+            "SELECT public.lock_bitemporal_keys(ARRAY("
+            f"SELECT populate_record(NULL::{_qualified_name(self._table)}, "
+            "hstore(CAST(:names AS text[]), "
+            f"ARRAY[{', '.join(f'CAST(k.{c} AS text)' for c in columns)}])) "
+            f"FROM unnest({', '.join(f':{c}' for c in columns)}) "
+            f"AS k({', '.join(columns)})"
+            "), CAST(:names AS text[]))"
         ).bindparams(
             sql.bindparam("names", names, type_=ARRAY(Text)),
             *(
-                sql.bindparam(f"v{i}", type_=self._table.c[name].type)
-                for i, (name, _) in enumerate(pairs)
+                sql.bindparam(
+                    column,
+                    [key[name] for key in keys],
+                    type_=ARRAY(self._table.c[name].type),
+                )
+                for column, name in zip(columns, names, strict=True)
             ),
         )
-        self.session.execute(statement, params)
+        self.session.execute(statement)
 
     def query_key(self, key: Key) -> Query[ModelT]:
         """Build a query into the current table of a model, given a bitemporal key."""
@@ -225,8 +238,8 @@ class Writer[ModelT: Bitemporal[object]]:
             2. Partition the record into two distinct application periods.
             3. Trim the application period's prefix or suffix.
         """
-        # Lock before reading, so the rows read are the latest committed versions.
-        self.lock_key(key)
+        # Lock first: the first read is part of the critical region.
+        self.lock_keys([key])
         # Load first. Deleting or updating while the query streams skips rows.
         overlaps = (
             self.query_key(key=key)

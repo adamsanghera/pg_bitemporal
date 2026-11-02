@@ -89,13 +89,12 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Lock one bitemporal key until the transaction ends. `row_value` is a row of the
--- current table (only its key columns are read), so the trigger can pass OLD or NEW and
--- Writer.lock_key can pass a row built from the key's values. The lock id hashes the
--- table and the typed key values, so it does not depend on DateStyle or TimeZone. Two
--- keys that happen to share a hash only make each other wait.
-CREATE OR REPLACE FUNCTION public.lock_bitemporal_key (row_value anyelement, key_columns text[])
-    RETURNS void
+-- The advisory lock id for `row_value`'s key: a hash of the table and the typed key
+-- values, so it does not depend on DateStyle or TimeZone. `row_value` is a row of the
+-- current table, and only its key columns are read. Two keys that happen to share a
+-- hash only make each other wait.
+CREATE OR REPLACE FUNCTION public._bitemporal_lock_id (row_value anyelement, key_columns text[])
+    RETURNS bigint
     AS $$
 DECLARE
     lock_id bigint;
@@ -105,7 +104,36 @@ BEGIN
         (SELECT string_agg(format('($1).%I', col), ', ') FROM unnest(key_columns) AS col))
     INTO lock_id
     USING row_value;
-    PERFORM pg_advisory_xact_lock(lock_id);
+    RETURN lock_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Lock one bitemporal key until the transaction ends. The trigger passes OLD or NEW.
+CREATE OR REPLACE FUNCTION public.lock_bitemporal_key (row_value anyelement, key_columns text[])
+    RETURNS void
+    AS $$
+BEGIN
+    PERFORM pg_advisory_xact_lock(public._bitemporal_lock_id(row_value, key_columns));
+END;
+$$ LANGUAGE plpgsql;
+
+-- Lock several keys of one table until the transaction ends, in one call. The locks are
+-- taken in lock-id order, so two transactions locking overlapping sets queue on the
+-- first key they share instead of deadlocking, whatever order the caller listed them.
+-- Writer.lock_keys builds `row_values` from the keys' values.
+CREATE OR REPLACE FUNCTION public.lock_bitemporal_keys (row_values anyarray, key_columns text[])
+    RETURNS void
+    AS $$
+DECLARE
+    lock_id bigint;
+BEGIN
+    FOR lock_id IN
+        SELECT DISTINCT public._bitemporal_lock_id(r, key_columns)
+        FROM unnest(row_values) AS r
+        ORDER BY 1
+    LOOP
+        PERFORM pg_advisory_xact_lock(lock_id);
+    END LOOP;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -163,8 +191,8 @@ $$ LANGUAGE plpgsql;
 -- * A transaction time earlier than the key's latest write is refused. If
 --   set_transaction_time pinned it, that's backdating. If the clock pinned it, another
 --   transaction wrote the key after this one's time was fixed by an earlier write: a
---   serialization failure (40001), which the caller retries. Locking every key first,
---   in sorted order, prevents it.
+--   serialization failure (40001), which the caller retries. Locking every key first
+--   (lock_bitemporal_keys) prevents it.
 -- * It is sometimes helpful to pause history tracking, if we want to make a migration
 --   without impacting history (although this is obviously discouraged).
 --   `toggle_record_history` sets the transaction-local `pg_bitemporal.history_disabled`.
@@ -236,7 +264,7 @@ BEGIN
             'transaction''s time %', last_write, measured_time
             USING errcode = 'serialization_failure',
                 hint = 'Retry the transaction. To avoid this, lock every key the '
-                    'transaction writes, in sorted order, before writing any of them.';
+                    'transaction writes before writing any of them (Writer.lock_keys).';
     END IF;
 
     -- insert: very simple! new row beginning at current time.

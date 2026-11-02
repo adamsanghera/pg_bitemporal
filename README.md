@@ -172,28 +172,6 @@ undo them sooner. They keep their state in the transaction-local settings
 Transaction time only moves forward: writing a key at a time earlier than its last
 write raises an error.
 
-## Concurrent writers
-
-Each write locks its bitemporal key until the transaction ends
-(`lock_bitemporal_key`, a transaction-scoped advisory lock), so two transactions
-writing the same key take turns. The transaction's time is the clock at its first
-write, read *after* that write's lock is held. A transaction that waited for another
-therefore gets a later time than everything the other wrote.
-
-A transaction that writes several keys can still meet a key that another transaction
-wrote after its own time was fixed. That write fails with a serialization failure
-(SQLSTATE `40001`), which the application should retry. To avoid it, lock every key the
-transaction will write, in sorted order, before writing any of them:
-
-```python
-writer = Writer(Address, session)
-for user_id in sorted(user_ids):
-    writer.lock_key({"user_id": user_id})
-```
-
-Sorting also prevents two such transactions from deadlocking. If they do deadlock
-(SQLSTATE `40P01`), Postgres aborts one of them, and it can be retried the same way.
-
 `record_txn_history` copies retired rows into the history table by column name, so
 the history table's columns can be in any order. It refuses a current-table column
 that the history table lacks, rather than dropping it.

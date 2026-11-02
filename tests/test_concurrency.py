@@ -117,14 +117,14 @@ def test_a_writer_holds_its_key_until_commit(two):
     _rename(t1, "acct-2", "Bea")
     t2.execute(text("SET LOCAL lock_timeout = '100ms'"))
     with pytest.raises(DBAPIError) as info:
-        Writer(Account, t2).lock_key({"account": "acct-2"})
+        Writer(Account, t2).lock_keys([{"account": "acct-2"}])
     assert _sqlstate(info.value) == "55P03"  # lock_not_available
 
 
 def test_the_lock_covers_a_key_with_no_rows_yet(two):
     """Two transactions inserting a brand-new key queue on the lock."""
     t1, t2 = two
-    Writer(Account, t1).lock_key({"account": "acct-new"})
+    Writer(Account, t1).lock_keys([{"account": "acct-new"}])
     t2.execute(text("SET LOCAL lock_timeout = '100ms'"))
     with pytest.raises(DBAPIError) as info:
         t2.add(Account(account="acct-new", owner="Bea", app_period=APP_PERIOD))
@@ -160,18 +160,16 @@ def test_a_later_key_written_after_the_transaction_time_is_a_serialization_failu
     with pytest.raises(DBAPIError) as info:
         _rename(t1, "acct-b", "Dee")
     assert _sqlstate(info.value) == "40001"
-    assert "lock every key the transaction writes" in str(info.value)
+    assert "Writer.lock_keys" in str(info.value)
 
 
 def test_locking_every_key_first_avoids_the_failure(two):
-    """Locking A and B up front (sorted) makes T2 wait instead, so T1 succeeds."""
+    """Locking A and B up front makes T2 wait instead, so T1 succeeds."""
     t1, t2 = two
     _open(t1, "acct-c", "Ada")
     _open(t1, "acct-d", "Ada")
 
-    writer = Writer(Account, t1)
-    for account in sorted(["acct-d", "acct-c"]):
-        writer.lock_key({"account": account})
+    Writer(Account, t1).lock_keys([{"account": "acct-d"}, {"account": "acct-c"}])
     _rename(t1, "acct-c", "Bea")
 
     t2.execute(text("SET LOCAL lock_timeout = '100ms'"))
@@ -197,3 +195,23 @@ def test_clear_key_period_waits_for_the_key_before_reading(two):
             TimeRange(datetime(2022, 6, 1, tzinfo=UTC), None),
         )
     assert _sqlstate(info.value) == "55P03"
+
+
+def test_lock_keys_takes_every_key_in_one_call(two):
+    """Each listed key is held, including duplicates and keys with no rows yet."""
+    t1, t2 = two
+    Writer(Account, t1).lock_keys(
+        [{"account": "acct-x"}, {"account": "acct-y"}, {"account": "acct-x"}]
+    )
+    for account in ("acct-x", "acct-y"):
+        t2.execute(text("SAVEPOINT probe"))
+        t2.execute(text("SET LOCAL lock_timeout = '100ms'"))
+        with pytest.raises(DBAPIError) as info:
+            Writer(Account, t2).lock_keys([{"account": account}])
+        assert _sqlstate(info.value) == "55P03"
+        t2.execute(text("ROLLBACK TO SAVEPOINT probe"))
+
+
+def test_lock_keys_with_no_keys_does_nothing(two):
+    t1, _ = two
+    Writer(Account, t1).lock_keys([])
