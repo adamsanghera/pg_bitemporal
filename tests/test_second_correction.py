@@ -10,6 +10,7 @@ import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import psycopg
 import pytest
 from psycopg import OperationalError as PsycopgOperationalError
 from psycopg.types.range import TimestamptzRange
@@ -24,7 +25,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.engine.url import make_url
-from sqlalchemy.exc import NoResultFound, OperationalError
+from sqlalchemy.exc import DBAPIError, NoResultFound, OperationalError
 from sqlalchemy.orm import sessionmaker
 
 from pg_bitemporal.sqlalchemy.base import (
@@ -412,3 +413,78 @@ def test_orm_writes_to_history_name_the_table(session, user_id, verb, mutate):
     mutate(session, target)
     with pytest.raises(ValueError, match=f"^May not {verb} {_HISTORY}$"):
         session.flush()
+
+
+def _history_count(session, uid: int) -> int:
+    return session.execute(
+        text(f"SELECT count(*) FROM {_HISTORY} WHERE user_id = :uid"), {"uid": uid}
+    ).scalar_one()
+
+
+def test_a_table_named_like_the_old_flag_does_not_disable_history(session):
+    """The flags are settings now, so no table on search_path can flip them."""
+    uid = 20
+    _record_apple(session, uid)
+    session.execute(text("CREATE TABLE public.record_history_disabled ()"))
+    try:
+        _write_at(session, JUN_20, lambda: _set_street(session, uid, "456 Banana St"))
+        assert _history_count(session, uid) == 1
+    finally:
+        session.execute(text("DROP TABLE public.record_history_disabled"))
+        session.commit()
+
+
+def test_pinned_time_reads_back_under_another_datestyle_and_zone(session):
+    """The pinned instant does not depend on the session's display settings."""
+    uid = 21
+
+    def insert_elsewhere() -> None:
+        session.execute(text("SET LOCAL DateStyle = 'SQL, DMY'"))
+        session.execute(text("SET LOCAL TIME ZONE 'America/New_York'"))
+        # Plain SQL: psycopg cannot parse timestamps returned under this DateStyle.
+        session.execute(
+            text(
+                f"INSERT INTO {_CURRENT} (user_id, street, app_period) "
+                "VALUES (:uid, '1 Oak St', '[2022-01-01Z,)')"
+            ),
+            {"uid": uid},
+        )
+
+    _write_at(session, JUN_20 + timedelta(microseconds=7), insert_elsewhere)
+    row = session.query(Address).filter(Address.user_id == uid).one()
+    assert row.txn_period.lower == JUN_20 + timedelta(microseconds=7)
+
+
+def test_flags_end_with_the_transaction(session):
+    """A pinned time and a paused history both reset at commit."""
+    uid = 22
+    _record_apple(session, uid)
+
+    session.execute(text("SELECT public.toggle_record_history(false)"))
+    _set_street(session, uid, "456 Banana St")
+    session.commit()
+    assert _history_count(session, uid) == 0
+
+    # The next transaction tracks history again, at the wall clock.
+    _set_street(session, uid, "789 Cherry St")
+    session.commit()
+    assert _history_count(session, uid) == 1
+    row = session.query(Address).filter(Address.user_id == uid).one()
+    assert row.txn_period.lower > JUL_2
+
+
+def test_pinning_while_history_is_off_says_why(session):
+    session.execute(text("SELECT public.toggle_record_history(false)"))
+    with pytest.raises(DBAPIError, match="no effect while history tracking is off"):
+        session.execute(text("SELECT public.set_transaction_time(now())"))
+
+
+def test_backdating_names_both_times(session):
+    uid = 23
+    _record_apple(session, uid)
+    with pytest.raises(DBAPIError, match="is before this row's last write") as info:
+        _write_at(session, BEFORE_APP, lambda: _set_street(session, uid, "Nope"))
+    orig = info.value.orig
+    assert isinstance(orig, psycopg.Error)
+    hint = orig.diag.message_hint or ""
+    assert hint.startswith("Transaction time only moves forward")

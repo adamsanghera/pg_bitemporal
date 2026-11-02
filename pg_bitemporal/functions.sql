@@ -1,36 +1,31 @@
--- force the transaction time for the sql transaction to be a particular timestamptz
+-- Both helpers below keep their state in custom settings set with
+-- `set_config(..., is_local => true)`. Postgres resets a local setting when the
+-- transaction ends, commit or rollback, so nothing outlives the transaction. An empty
+-- string means "unset": `current_setting(name, true)` returns NULL before the first
+-- `set_config` in a session, and '' after a reset.
+
+-- force the transaction time for the sql transaction to be a particular timestamptz.
+-- Pass NULL to go back to CURRENT_TIMESTAMP.
 CREATE OR REPLACE FUNCTION public.set_transaction_time (fixed_time timestamptz)
     RETURNS bool
     AS $$
 BEGIN
     -- this operation is meaningless if history-tracking is disabled
-    IF ((
-        SELECT
-            to_regclass ('record_history_disabled')) IS NOT NULL) THEN
-        RAISE EXCEPTION '`set_record_history` is not enabled';
+    IF (coalesce(current_setting('pg_bitemporal.history_disabled', true), '') <> '') THEN
+        RAISE EXCEPTION 'set_transaction_time has no effect while history tracking is off'
+            USING hint = 'Call toggle_record_history(true) first.';
     END IF;
 
-    -- stop forcing the `fixed_transaction_time`
-    IF (fixed_time IS NULL) THEN
-        DROP TABLE IF EXISTS fixed_transaction_time;
-        RETURN TRUE;
+    IF (NOT isfinite(fixed_time)) THEN
+        RAISE EXCEPTION 'set_transaction_time needs a finite time, got %', fixed_time;
     END IF;
 
-    -- create the temporary forcing-table, if it doesn't already exist
-    CREATE TEMPORARY TABLE IF NOT EXISTS fixed_transaction_time (
-        id int NOT NULL,
-        tmp_fixed_time timestamptz NOT NULL,
-        CONSTRAINT transaction_time_pkey PRIMARY KEY (id)
-    ) ON COMMIT DROP;
-
-    -- EXCLUDED qualifies the new value. An unqualified name is ambiguous
-    -- with the existing row's column.
-    INSERT INTO fixed_transaction_time (id, tmp_fixed_time)
-        VALUES (1, fixed_time)
-    ON CONFLICT (id)
-        DO UPDATE SET
-            tmp_fixed_time = EXCLUDED.tmp_fixed_time;
-
+    -- ISO 8601 in UTC reads back exactly whatever DateStyle and TimeZone are.
+    PERFORM
+        set_config('pg_bitemporal.txn_time',
+            coalesce(to_char(fixed_time AT TIME ZONE 'UTC',
+                'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'), ''),
+            true);
     RETURN TRUE;
 END;
 $$ LANGUAGE plpgsql;
@@ -43,14 +38,9 @@ CREATE OR REPLACE FUNCTION public.toggle_record_history (is_enabled bool)
     RETURNS bool
     AS $$
 BEGIN
-    -- create or drop a "flag-table" as appropriate.
-    -- if the table exists, we will not track history.
-    IF (is_enabled) THEN
-        DROP TABLE IF EXISTS record_history_disabled;
-    ELSE
-        CREATE TEMPORARY TABLE IF NOT EXISTS record_history_disabled ( ) ON COMMIT DROP;
-    END IF;
-
+    PERFORM
+        set_config('pg_bitemporal.history_disabled',
+            CASE WHEN is_enabled THEN '' ELSE 'on' END, true);
     RETURN TRUE;
 END;
 $$
@@ -78,18 +68,19 @@ LANGUAGE plpgsql;
 --   and do not write the intermediary information to the history table. This helps us
 --   avoid zero-sized ranges, but is a limitation worth knowing for app clients! 
 -- * Sometimes, we want to "freeze" the transaction time ourselves. Either for testing
---   reasons or for application reasons. We use a table `fixed_transaction_time` that
---   is accessible via `set_transaction_time`.
+--   reasons or for application reasons. `set_transaction_time` stores it in the
+--   transaction-local setting `pg_bitemporal.txn_time`.
 -- * When setting the old transaction period to the measured timestamp, it is possible
 --   for the period to post-date the measured timestamp. In this case, we barf.
 -- * It is sometimes helpful to pause history tracking, if we want to make a migration
---   without impacting history (although this is obviously discouraged). We have a
---   sentinel table, `record_history_disabled`, gated by `toggle_record_history`.
+--   without impacting history (although this is obviously discouraged).
+--   `toggle_record_history` sets the transaction-local `pg_bitemporal.history_disabled`.
 CREATE OR REPLACE FUNCTION public.record_txn_history ()
     RETURNS TRIGGER
     AS $$
 DECLARE
     measured_time timestamptz;
+    fixed_time text;
 BEGIN
     -- validate the argument (the transaction history table)
     -- TODO: validate table exists; although we'll raise further down if it doesn't.
@@ -99,7 +90,7 @@ BEGIN
     END IF;
 
     -- early-exit if trigger is disabled
-    IF ((to_regclass ('record_history_disabled')) IS NOT NULL) THEN
+    IF (coalesce(current_setting('pg_bitemporal.history_disabled', true), '') <> '') THEN
         IF (tg_op = 'INSERT') THEN
             RETURN new;
         elsif (tg_op = 'UPDATE') THEN
@@ -112,18 +103,8 @@ BEGIN
     END IF;
 
     -- measure time from either fixed value (if set) or current_timestamp.
-    -- to_regclass finds the transaction-local temp table. The SELECT has to
-    -- name that table: a regclass variable is not a FROM item.
-    IF (to_regclass('fixed_transaction_time') IS NOT NULL) THEN
-        SELECT
-            tmp_fixed_time INTO measured_time
-        FROM
-            fixed_transaction_time
-        WHERE
-            id = 1;
-    ELSE
-        measured_time := CURRENT_TIMESTAMP;
-    END IF;
+    fixed_time := nullif(current_setting('pg_bitemporal.txn_time', true), '');
+    measured_time := coalesce(fixed_time::timestamptz, CURRENT_TIMESTAMP);
 
     -- insert: very simple! new row beginning at current time.
     -- no need to update `old`, since it does not exist.
@@ -134,9 +115,10 @@ BEGIN
 
     -- not an insert, so we may truncate `old.txn_period`
     IF (measured_time < lower(OLD.txn_period)) THEN
-        RAISE EXCEPTION 'postgres time is lower than the previous txn period start'
-            USING hint = '';
-            -- TODO make a proper explanation
+        RAISE EXCEPTION 'transaction time % is before this row''s last write at %',
+            measured_time, lower(OLD.txn_period)
+            USING hint = 'Transaction time only moves forward. If set_transaction_time '
+                'pinned it, pass a time no earlier than the row''s last write.';
         elsif (measured_time = lower(OLD.txn_period)) THEN
             -- We don't need to persist data that's replaced in the *same DB transaction*,
             -- so we allow it to either be deleted or replaced with the latest value.
